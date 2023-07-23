@@ -1,6 +1,6 @@
 from borsh import deserialize, Schema
 from solana.connection import Connection
-from solana.publickey import PublicKey
+from solana.types.account import PublicKey
 import base64
 
 NAME_TOKENIZER_ID = PublicKey("nftD3vbNkNqfj2Sd3HZwbpw4BxxKWr4AjGb9X38JeZk")
