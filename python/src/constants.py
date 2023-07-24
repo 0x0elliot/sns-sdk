@@ -58,3 +58,8 @@ TOKENS_SYM_MINT = {
 PYTH_MAPPING_ACC = Pubkey.from_string("AHtgzX45WTKfkPG53L6WYhGEXwQkN1BVknET3sVsLL8J")
 
 VAULT_OWNER = Pubkey.from_string("GcWEQ9K78FV7LEHteFVciYApERk5YvQuFDQPk1yYJVXi")
+
+
+NAME_TOKENIZER_ID = Pubkey.from_string("nftD3vbNkNqfj2Sd3HZwbpw4BxxKWr4AjGb9X38JeZk")
+TOKEN_PROGRAM_ID = Pubkey.from_string('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA')
+MINT_PREFIX = bytes("tokenized_name", "utf-8")

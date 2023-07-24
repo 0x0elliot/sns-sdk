@@ -1,10 +1,8 @@
+import base64
 from borsh import deserialize, Schema
 from solana.connection import Connection
 from solana.types.account import PublicKey
-import base64
-
-NAME_TOKENIZER_ID = PublicKey("nftD3vbNkNqfj2Sd3HZwbpw4BxxKWr4AjGb9X38JeZk")
-MINT_PREFIX = bytes("tokenized_name", "utf-8")
+from src.constants import NAME_TOKENIZER_ID, MINT_PREFIX
 
 class Tag:
     Uninitialized = 0
