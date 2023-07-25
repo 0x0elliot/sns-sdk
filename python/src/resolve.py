@@ -10,10 +10,9 @@ import nacl.encoding
 from typing import Union, ByteString
 from record import get_record_key_sync
 from types.record import Record
-
 from construct import Struct, Bytes
 
-# tweetNACL is a library for encryption and decryption - in the TS implementation, it is "tweet" because it is a compact versio of the NACL library, we will use the full version
+# tweetnacl is shorter impl of nacl don't worry!
 def check_sol_record(record: ByteString, signed_record: ByteString, pubkey: bytes) -> bool:
     verify_key = nacl.signing.VerifyKey(pubkey)
     try:
@@ -24,6 +23,7 @@ def check_sol_record(record: ByteString, signed_record: ByteString, pubkey: byte
 
 def fetch_solana_record(connection: Client, domain_pub_key: str, registry: str) -> Pubkey:
     record_key = get_record_key_sync(registry, Record.SOL)
+    sol_record 
 
 def resolve(connection: Client, domain: str) -> Optional[str]:
     domain_pub_key = get_domain_key_sync(domain)["pubkey"]
