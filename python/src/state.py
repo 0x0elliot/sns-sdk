@@ -4,7 +4,7 @@ import base64
 from construct import Struct, Bytes
 from solana.rpc.api import Client
 from solana.rpc.types import Pubkey
-from src.nft import retrieve_nft_owner
+from nft import retrieve_nft_owner
 
 class NameRegistryState:
     HEADER_LEN = 96
@@ -15,6 +15,7 @@ class NameRegistryState:
         self.class_name = class_name
         self.data = None
 
+    # cls = method 
     @classmethod
     def retrieve(cls, connection, name_account_key):
         name_account_info = connection.get_account_info(name_account_key).value
@@ -30,25 +31,29 @@ class NameRegistryState:
 
         data = name_account_info.data
 
-        res = schema.parse(data)
+        res = schema.parse(data) 
 
-        name_registry_state = cls(res.parent_name, res.owner, res.class_name)
+        # name_registry_state = cls(res.parent_name, res.owner, res.class_name)
 
         # name_registry_state.data = name_account_info.data[cls.HEADER_LEN:]
-        name_registry_state.data = name_account_info.data
+        # name_registry_state.data = name_account_info.data
 
         nft_owner = retrieve_nft_owner(connection, name_account_key)
 
+        name_registry_state = None
         return {"registry": name_registry_state, "nft_owner": nft_owner}
-
+        # imp
 
 if __name__ == "__main__":
     connection = Client("https://rpc-public.hellomoon.io")
     sol_mint_addr = Pubkey.from_string("CEsUekjcbeReMuCuTtM2N7CjmsMzYfXkbZRX7rtSGCKS")
     nameRe = NameRegistryState.retrieve(connection, sol_mint_addr)
-    registry = nameRe["registry"]
+    registry = nameRe
 
-    print(registry.owner)
+    print(registry)
 
     # convert bytes to string
     # print(registry.owner.decode(32))
+
+
+# focus on registry object

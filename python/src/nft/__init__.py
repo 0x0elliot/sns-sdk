@@ -1,5 +1,5 @@
 from solana.rpc.api import Client
-from src.constants import MINT_PREFIX, NAME_TOKENIZER_ID, TOKEN_PROGRAM_ID
+from constants import MINT_PREFIX, NAME_TOKENIZER_ID, TOKEN_PROGRAM_ID
 from solana.rpc.types import Pubkey as PublicKey
 
 def retrieve_nft_owner(connection: Client, name_account: PublicKey):
@@ -46,4 +46,3 @@ def retrieve_nft_owner(connection: Client, name_account: PublicKey):
         return PublicKey(result[0]["account"]["data"][32:64])
     except Exception:
         return None
-
