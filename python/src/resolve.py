@@ -8,6 +8,8 @@ from nft import retrieve_nft_owner
 import nacl.signing
 import nacl.encoding
 from typing import Union, ByteString
+from record import get_record_key_sync
+from types.record import Record
 
 from construct import Struct, Bytes
 
@@ -20,9 +22,20 @@ def check_sol_record(record: ByteString, signed_record: ByteString, pubkey: byte
     except nacl.exceptions.BadSignatureError:
         return False
 
+def fetch_solana_record(connection: Client, domain_pub_key: str, registry: str) -> Pubkey:
+    record_key = get_record_key_sync(registry, Record.SOL)
+
 def resolve(connection: Client, domain: str) -> Optional[str]:
     domain_pub_key = get_domain_key_sync(domain)["pubkey"]
     
+    [registry, nft_owner] = NameRegistryState.retrieve(connection, domain_pub_key)
+
+    if nft_owner:
+        return nft_owner
+    
+    else:
+        fetch_solana_record(connection, domain_pub_key, registry)
+
 
 if __name__ == "__main__":
     connection = Client("https://rpc-public.hellomoon.io")
@@ -49,3 +62,4 @@ if __name__ == "__main__":
         # print(owner)
         # quit()
         # assert x["owner"] == owner
+        pass
