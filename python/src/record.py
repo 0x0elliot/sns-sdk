@@ -43,4 +43,18 @@ def deserializeRecord(
         record_key: Pubkey,
         registry: NameRegistryState = None
 ) -> str:
-    return None
+    buffer = registry.data
+    if not buffer:
+        return None
+    
+    size = RECORD_V1_SIZE.get(record)
+    idx = trim_null_padding_idx(buffer)
+
+    if not size:
+        return buffer.slice(0, idx).decode("utf-8")
+
+
+def trim_null_padding_idx(buffer: bytes) -> int:
+    arr = list(buffer)
+    last_non_null = len(arr) - 1 - arr[::-1].index(next((byte for byte in reversed(arr) if byte != 0), 0))
+    return last_non_null + 1
