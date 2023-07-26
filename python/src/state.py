@@ -29,14 +29,14 @@ class NameRegistryState:
 
 
 class TokenData(CStruct):
-    _schema = [
-        ("name", String),
-        ("ticker", String),
-        ("mint", Bytes(32)),
-        ("decimals", U8),
-        ("website", Optional(String)),
-        ("logoUri", Optional(String))
-    ]
+    _schema_fields = CStruct(
+        "name" / String,
+        "ticker" / String,
+        "mint" / Bytes(32),
+        "decimals" / U8,
+        "website" / Optional(String),
+        "logoUri" / Optional(String)
+    )
 
     def __init__(self, name: str, ticker: str, mint: bytes, decimals: int,
                  website: Optional[str] = None, logoUri: Optional[str] = None):
@@ -46,14 +46,21 @@ class TokenData(CStruct):
         self.decimals = decimals
         self.website = website
         self.logoUri = logoUri
+        self.packed_token_dictionary = {"name": name, "ticker": ticker,
+                                        "mint": mint, "decimals": decimals,
+                                        "website": website, "logoUri": logoUri}
 
     def serialize(self) -> Bytes:
-        return self._serialize(self._schema, self)
-    
+        return self._schema_fields.build(self.packed_token_dictionary)
+
     '''
     @NOTE - We do not need a deserializeUnchecked() here since 
     Python is dynamically typed - in TS the the 
     deserializeUnchecked function simply takes in a generic.
     '''
+
     def deserialize(self, buffer: Bytes):
         return self._deserialize(self._schema, buffer)
+
+# class Mint:
+#     _schema =
