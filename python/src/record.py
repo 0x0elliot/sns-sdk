@@ -52,6 +52,8 @@ def deserializeRecord(
 
     if not size:
         return buffer.slice(0, idx).decode("utf-8")
+    
+    # @TODO: implement OLD RECORD
 
 
 def trim_null_padding_idx(buffer: bytes) -> int:
