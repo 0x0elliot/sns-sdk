@@ -22,8 +22,6 @@ def get_sol_record(connection: Client, domain_pub_key: str, registry: str) -> Pu
     return get_record(connection, domain_pub_key, registry, Record.SOL)
 
 # always use in try catch
-
-
 def get_record(
         connection: Client, domain: str, record: Record, deserialize: bool = True
 ) -> NameRegistryState:
