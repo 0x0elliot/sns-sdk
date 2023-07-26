@@ -1,6 +1,6 @@
 from utils import get_domain_key_sync
 from enum import Enum
-from types.record import Record
+from types.record import Record, RECORD_V1_SIZE
 from solana.rpc.api import Client
 from solana.rpc.types import Pubkey
 from state import NameRegistryState
@@ -27,3 +27,20 @@ def get_record(
 
     if not registry.data:
         SNSError(error_type=ErrorType.NoRecordData)
+
+    
+    if deserialize:
+        return deserializeRecord(registry, record, public_key)
+    
+    record_size = RECORD_V1_SIZE.get(record)
+    registry.data = registry.data.slice(0, record_size)
+
+    return registry
+
+
+def deserializeRecord(
+        record: Record,
+        record_key: Pubkey,
+        registry: NameRegistryState = None
+) -> str:
+    return None
