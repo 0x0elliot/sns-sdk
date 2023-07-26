@@ -5,7 +5,14 @@ from solana.rpc.api import Client
 from solana.rpc.types import Pubkey
 from state import NameRegistryState
 from errors import ErrorType, SNSError
+import ipaddress
 
+def is_valid_network(ip_network):
+    try:
+        network_obj = ipaddress.ip_network(ip_network)
+        return True
+    except ValueError:
+        return False
 
 def get_record_key_sync(domain: str, record: Record) -> str:
     pubkey = get_domain_key_sync(record + "." + domain, True)["pubkey"]
@@ -58,13 +65,19 @@ def deserializeRecord(
         address = buffer.slice(0, 32).decode("utf-8")
         if record == Record.Injective:
             decoded = decode(address)
-            if decoded.prefix == "inj" && decoded.data.length = 20:
+            if decoded.prefix == "inj" and decoded.data.length == 20:
                 return address
             elif record == Record.BSC or record == Record.ETH:
                 prefix = address.slice(0, 2)
                 print("Something might go wrong here ~ Record.py line 64")
                 hex = address.slice(2, 42)
-                if prefix == "0x" && hex.length == 40:
+                if prefix == "0x" and hex.length == 40:
+                    return address
+                elif record == Record.A or record == Record.AAAA:
+                    if is_valid_network(address) is not None:
+                        return address
+        else:
+            SNSError(error_type=ErrorType.InvalidRecordData)
 
 def trim_null_padding_idx(buffer: bytes) -> int:
     arr = list(buffer)
