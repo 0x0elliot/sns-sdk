@@ -7,7 +7,7 @@ from solana.rpc.types import Pubkey
 from nft import retrieve_nft_owner
 from typing import Optional
 from errors import ErrorType, SNSError
-from borsh_construct import CStruct, String, U8, Optional
+from borsh_construct import CStruct, String, U8, Optional, U32
 
 
 class NameRegistryState:
@@ -33,12 +33,12 @@ class TokenData(CStruct):
         "name" / String,
         "ticker" / String,
         "mint" / Bytes(32),
-        "decimals" / U8,
+        "decimals" / U32,
         "website" / Optional(String),
         "logoUri" / Optional(String)
     )
 
-    def __init__(self, name: str, ticker: str, mint: bytes, decimals: int,
+    def __init__(self, name: str, ticker: str, mint: U32, decimals: int,
                  website: Optional[str] = None, logoUri: Optional[str] = None):
         self.name = name
         self.ticker = ticker
@@ -62,5 +62,13 @@ class TokenData(CStruct):
     def deserialize(self, buffer: Bytes):
         return self._deserialize(self._schema, buffer)
 
-# class Mint:
-#     _schema =
+class Mint:
+    mint: U8
+
+    _schema = CStruct(
+        "mint" / U32
+    )
+    def __init__(self, mint: U32) -> None:
+        self.mint = mint
+
+    
