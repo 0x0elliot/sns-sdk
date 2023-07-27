@@ -9,9 +9,24 @@ from typing import Optional
 from errors import ErrorType, SNSError
 from borsh_construct import CStruct, String, U8, Optional, U32
 
-
 class NameRegistryState:
     HEADER_LEN = 96
+
+    _schema = CStruct(
+        "parent_name" / Bytes(32),
+        "owner" / Bytes(32),
+        "class_pubKey" / Bytes(32),
+    )
+
+    def serialize(self) -> Bytes:
+        return self._schema.build(self)
+    
+    def deserialize(self, buffer: Bytes):
+        return self._deserialize(self._schema, buffer)
+    
+    @staticmethod
+    def deserializeUnchecked(buffer: Bytes):
+        return NameRegistryState._deserialize(NameRegistryState._schema, buffer)
 
     def __init__(self, parent_name, owner, class_pubKey, data=None):
         self.parent_name: Pubkey = parent_name
@@ -26,6 +41,8 @@ class NameRegistryState:
         name_account = await connection.get_account_info(nameAccountKey)
         if not name_account:
             SNSError(error_type=ErrorType.NoNameAccount)
+
+        res: NameRegistryState = cls.deserializeUnchecked(name_account.data)
 
 
 class TokenData(CStruct):
