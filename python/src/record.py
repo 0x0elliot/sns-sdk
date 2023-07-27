@@ -7,6 +7,39 @@ from state import NameRegistryState
 from errors import ErrorType, SNSError
 import ipaddress
 
+def serialize_record(record: Record, data: str) -> bytes:
+    size = RECORD_V1_SIZE.get(record)
+
+    if not size:
+        if record in (Record.CNAME, Record.TXT):  # Changed "or" to "in"
+            data_bytes = data.encode("utf-8")  # Renamed "str" to "data" to avoid shadowing
+            return bytes(data_bytes)
+
+    if record == Record.SOL:
+        raise SNSError(error_type=ErrorType.UnsupportedRecordType, message="Use serialize_sol_record instead")
+    elif record == Record.ETH or record == Record.BSC:
+        if not data.startswith("0x"):
+            raise SNSError(error_type=ErrorType.InvalidEvmAddress)
+        hex_data = data[2:]
+        return bytes.fromhex(hex_data)
+    elif record == Record.Injective:
+        decoded = decode(data)
+        if decoded.prefix != "inj" or len(decoded.data) != 20:
+            raise SNSError(error_type=ErrorType.InvalidInjectiveAddress)
+        return bytes(decoded.data)
+    elif record == Record.A:
+        ip = ipaddress.IPv4Address(data)
+        array = ip.packed
+        if len(array) != 4:
+            raise SNSError(error_type=ErrorType.InvalidARecord)
+        return bytes(array)
+    elif record == Record.AAAA:
+        ip = ipaddress.IPv6Address(data)
+        array = ip.packed
+        if len(array) != 16:
+            raise SNSError(error_type=ErrorType.InvalidAAAARecord)
+        return bytes(array)
+
 def is_valid_network(ip_network):
     try:
         network_obj = ipaddress.ip_network(ip_network)

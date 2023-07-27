@@ -44,7 +44,6 @@ class NameRegistryState:
 
         res: NameRegistryState = cls.deserializeUnchecked(name_account.data)
 
-
 class TokenData(CStruct):
     _schema_fields = CStruct(
         "name" / String,
