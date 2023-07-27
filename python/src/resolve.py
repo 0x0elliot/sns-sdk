@@ -12,18 +12,23 @@ from record import get_record_key_sync
 from types.record import Record
 from construct import Struct, Bytes
 
-# tweetnacl is shorter impl of nacl don't worry!
-def check_sol_record(record: ByteString, signed_record: ByteString, pubkey: bytes) -> bool:
-    verify_key = nacl.signing.VerifyKey(pubkey)
+def verify_detached_signature(
+        data: bytes, signature: bytes, pubkey_bytes: bytes) -> bool:
     try:
-        verify_key.verify(signed_record, record)
-        return True
+        public_key = nacl.signing.VerifyKey(
+            pubkey_bytes, encoder=nacl.encoding.RawEncoder)
+        public_key.verify(data, signature)
+        return True  # Signature is valid
     except nacl.exceptions.BadSignatureError:
-        return False
+        return False  # Signature is invalid
+
+def check_sol_record(record: bytes, signed_record: bytes, pubkey: Pubkey) -> bool:
+    return verify_detached_signature(record, signed_record, pubkey)
+
 
 def fetch_solana_record(connection: Client, domain_pub_key: str, registry: str) -> Pubkey:
     record_key = get_record_key_sync(registry, Record.SOL)
-    sol_record 
+    sol_record = connection.get_account_info(record_key)
 
 def resolve(connection: Client, domain: str) -> Optional[str]:
     domain_pub_key = get_domain_key_sync(domain)["pubkey"]

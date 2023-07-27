@@ -2,25 +2,12 @@ import ipaddress
 from types.record import RECORD_V1_SIZE, Record
 from typing import Optional
 
-import nacl.encoding
-import nacl.exceptions
-import nacl.signing
 from errors import ErrorType, SNSError
 from solana.rpc.api import Client
 from solana.rpc.types import Pubkey
 from state import NameRegistryState
 from utils import get_domain_key_sync
-
-
-def verify_detached_signature(
-        data: bytes, signature: bytes, pubkey_bytes: bytes) -> bool:
-    try:
-        public_key = nacl.signing.VerifyKey(
-            pubkey_bytes, encoder=nacl.encoding.RawEncoder)
-        public_key.verify(data, signature)
-        return True  # Signature is valid
-    except nacl.exceptions.BadSignatureError:
-        return False  # Signature is invalid
+from resolve import check_sol_record
 
 def serialize_record(record: Record, data: str) -> bytes:
     size = RECORD_V1_SIZE.get(record)
@@ -71,9 +58,7 @@ def get_record_key_sync(domain: str, record: Record) -> str:
 def get_sol_record(connection: Client, domain_pub_key: str, registry: str) -> Pubkey:
     return get_record(connection, domain_pub_key, registry, Record.SOL)
 
-def check_sol_record(record: bytes, signed_record: bytes, pubkey: Pubkey) -> bool:
-    return verify_detached_signature(record, signed_record, pubkey)
-   
+
 
 # always use in try catch
 def get_record(
