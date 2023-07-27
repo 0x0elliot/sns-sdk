@@ -1,22 +1,39 @@
-from utils import get_domain_key_sync
-from enum import Enum
-from types.record import Record, RECORD_V1_SIZE
+import ipaddress
+from types.record import RECORD_V1_SIZE, Record
+from typing import Optional
+
+import nacl.encoding
+import nacl.exceptions
+import nacl.signing
+from errors import ErrorType, SNSError
 from solana.rpc.api import Client
 from solana.rpc.types import Pubkey
 from state import NameRegistryState
-from errors import ErrorType, SNSError
-import ipaddress
+from utils import get_domain_key_sync
+
+
+def verify_detached_signature(
+        data: bytes, signature: bytes, pubkey_bytes: bytes) -> bool:
+    try:
+        public_key = nacl.signing.VerifyKey(
+            pubkey_bytes, encoder=nacl.encoding.RawEncoder)
+        public_key.verify(data, signature)
+        return True  # Signature is valid
+    except nacl.exceptions.BadSignatureError:
+        return False  # Signature is invalid
 
 def serialize_record(record: Record, data: str) -> bytes:
     size = RECORD_V1_SIZE.get(record)
 
     if not size:
-        if record in (Record.CNAME, Record.TXT):  # Changed "or" to "in"
-            data_bytes = data.encode("utf-8")  # Renamed "str" to "data" to avoid shadowing
+        if record in (Record.CNAME, Record.TXT): 
+            data_bytes = data.encode("utf-8")  
             return bytes(data_bytes)
 
     if record == Record.SOL:
-        raise SNSError(error_type=ErrorType.UnsupportedRecordType, message="Use serialize_sol_record instead")
+        raise SNSError(
+            error_type=ErrorType.UnsupportedRecordType, 
+            message="Use serialize_sol_record instead")
     elif record == Record.ETH or record == Record.BSC:
         if not data.startswith("0x"):
             raise SNSError(error_type=ErrorType.InvalidEvmAddress)
@@ -42,7 +59,7 @@ def serialize_record(record: Record, data: str) -> bytes:
 
 def is_valid_network(ip_network):
     try:
-        network_obj = ipaddress.ip_network(ip_network)
+        ipaddress.ip_network(ip_network)
         return True
     except ValueError:
         return False
@@ -53,6 +70,10 @@ def get_record_key_sync(domain: str, record: Record) -> str:
 
 def get_sol_record(connection: Client, domain_pub_key: str, registry: str) -> Pubkey:
     return get_record(connection, domain_pub_key, registry, Record.SOL)
+
+def check_sol_record(record: bytes, signed_record: bytes, pubkey: Pubkey) -> bool:
+    return verify_detached_signature(record, signed_record, pubkey)
+   
 
 # always use in try catch
 def get_record(
@@ -112,5 +133,73 @@ def deserializeRecord(
 def trim_null_padding_idx(buffer: bytes) -> int:
     arr = list(buffer)
     last_non_null = len(
-        arr) - 1 - arr[::-1].index(next((byte for byte in reversed(arr) if byte != 0), 0))
+        arr) - 1 - arr[::-1].index(
+        next((byte for byte in reversed(arr) if byte != 0), 0))
     return last_non_null + 1
+
+
+def get_ipfs_record(connection: Client, domain: str) -> Optional[str]:
+    return get_record(connection, domain, Record.IPFS, True)
+
+def get_arweave_record(connection: Client, domain: str) -> Optional[str]:
+    return get_record(connection, domain, Record.ARWV, True)
+
+def get_eth_record(connection: Client, domain: str) -> Optional[str]:
+    return get_record(connection, domain, Record.ETH, True)
+
+def get_btc_record(connection: Client, domain: str) -> Optional[str]:
+    return get_record(connection, domain, Record.BTC, True)
+
+def get_ltc_record(connection: Client, domain: str) -> Optional[str]:
+    return get_record(connection, domain, Record.LTC, True)
+
+def get_doge_record(connection: Client, domain: str) -> Optional[str]:
+    return get_record(connection, domain, Record.DOGE, True)
+
+def get_email_record(connection: Client, domain: str) -> Optional[str]:
+    return get_record(connection, domain, Record.Email, True)
+
+def get_url_record(connection: Client, domain: str) -> Optional[str]:
+    return get_record(connection, domain, Record.Url, True)
+
+def get_discord_record(connection: Client, domain: str) -> Optional[str]:
+    return get_record(connection, domain, Record.Discord, True)
+
+def get_github_record(connection: Client, domain: str) -> Optional[str]:
+    return get_record(connection, domain, Record.Github, True)
+
+def get_reddit_record(connection: Client, domain: str) -> Optional[str]:
+    return get_record(connection, domain, Record.Reddit, True)
+
+def get_twitter_record(connection: Client, domain: str) -> Optional[str]:
+    return get_record(connection, domain, Record.Twitter, True)
+
+def get_telegram_record(connection: Client, domain: str) -> Optional[str]:
+    return get_record(connection, domain, Record.Telegram, True)
+
+def get_pic_record(connection: Client, domain: str) -> Optional[str]:
+    return get_record(connection, domain, Record.Pic, True)
+
+def get_shdw_record(connection: Client, domain: str) -> Optional[str]:
+    return get_record(connection, domain, Record.SHDW, True)
+
+def get_point_record(connection: Client, domain: str) -> Optional[str]:
+    return get_record(connection, domain, Record.POINT, True)
+
+def get_bsc_record(connection: Client, domain: str) -> Optional[str]:
+    return get_record(connection, domain, Record.BSC, True)
+
+def get_injective_record(connection: Client, domain: str) -> Optional[str]:
+    return get_record(connection, domain, Record.Injective, True)
+
+def get_backpack_record(connection: Client, domain: str) -> Optional[str]:
+    return get_record(connection, domain, Record.Backpack, True)
+
+def serialize_sol_record(
+        content: Pubkey, record_key: Pubkey, signer: Pubkey, signature: bytes) -> bytes:
+    expected = bytes(content) + bytes(record_key)
+    encoded_message = expected.hex().encode()
+    valid = check_sol_record(encoded_message, signature, signer)
+    check_sol_record(valid, ErrorType.InvalidSignature)
+
+    return bytes(content) + signature
