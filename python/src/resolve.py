@@ -56,6 +56,9 @@ def resolve(connection: Client, domain: str) -> Optional[str]:
         }
     '''
 
+    return registry.owner
+
+
 
 if __name__ == "__main__":
     connection = Client("https://rpc-public.hellomoon.io")
