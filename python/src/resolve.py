@@ -58,8 +58,6 @@ def resolve(connection: Client, domain: str) -> Optional[str]:
 
     return registry.owner
 
-
-
 if __name__ == "__main__":
     connection = Client("https://rpc-public.hellomoon.io")
 
@@ -80,9 +78,5 @@ if __name__ == "__main__":
     ]
 
     for x in LIST:
-        # owner = resolve(connection, x["domain"])
-        # owner = res
-        # print(owner)
-        # quit()
-        # assert x["owner"] == owner
-        pass
+        owner = resolve(connection, x["domain"])
+        print(f"Domain: {x['domain']}, Owner: {owner}, Expected: {x['owner']}")
