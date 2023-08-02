@@ -55,10 +55,10 @@ def get_record_key_sync(domain: str, record: Record) -> str:
     pubkey = get_domain_key_sync(record + "." + domain, True)["pubkey"]
     return pubkey
 
-def get_sol_record(connection: Client, domain_pub_key: str, registry: str) -> Pubkey:
-    return get_record(connection, domain_pub_key, registry, Record.SOL)
-
-
+def get_sol_record(connection: Client, domain_pub_key: str) -> Pubkey:
+    return get_record(
+        connection=connection, domain=domain_pub_key, 
+        record=Record.SOL, deserialize=False)
 
 # always use in try catch
 def get_record(
