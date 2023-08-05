@@ -1,13 +1,9 @@
-import json
-import base64
-from base58 import b58decode
-from construct import Struct, Bytes
+from construct import Bytes
 from solana.rpc.api import Client
 from solana.rpc.types import Pubkey
-from nft import retrieve_nft_owner
 from typing import Optional
 from errors import ErrorType, SNSError
-from borsh_construct import CStruct, String, U8, Optional, U32
+from borsh_construct import CStruct, String, U8, U32
 
 class NameRegistryState:
     HEADER_LEN = 96
@@ -50,8 +46,8 @@ class TokenData(CStruct):
         "ticker" / String,
         "mint" / Bytes(32),
         "decimals" / U32,
-        "website" / Optional(String),
-        "logoUri" / Optional(String)
+        "website" / Optional[String],
+        "logoUri" / Optional[String]
     )
 
     def __init__(self, name: str, ticker: str, mint: U32, decimals: int,
