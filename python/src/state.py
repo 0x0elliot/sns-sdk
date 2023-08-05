@@ -39,6 +39,7 @@ class NameRegistryState:
             SNSError(error_type=ErrorType.NoNameAccount)
 
         res: NameRegistryState = cls.deserializeUnchecked(name_account.data)
+        return res.data
 
 class TokenData(CStruct):
     _schema_fields = CStruct(

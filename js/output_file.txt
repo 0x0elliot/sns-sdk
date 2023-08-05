@@ -1,0 +1,4716 @@
+import { Connection, PublicKey, MemcmpFilter } from "@solana/web3.js";
+import BN from "bn.js";
+import { sha256 } from "@ethersproject/sha2";
+import { HASH_PREFIX, NAME_PROGRAM_ID, ROOT_DOMAIN_ACCOUNT } from "./constants";
+import { NameRegistryState } from "./state";
+import { REVERSE_LOOKUP_CLASS } from "./constants";
+import { Buffer } from "buffer";
+import { ErrorType, SNSError } from "./error";
+
+export const getHashedNameSync = (name: string): Buffer => {
+  const input = HASH_PREFIX + name;
+  const str = sha256(Buffer.from(input, "utf8")).slice(2);
+  return Buffer.from(str, "hex");
+};
+
+export const getNameAccountKeySync = (
+  hashed_name: Buffer,
+  nameClass?: PublicKey,
+  nameParent?: PublicKey
+): PublicKey => {
+  const seeds = [hashed_name];
+  if (nameClass) {
+    seeds.push(nameClass.toBuffer());
+  } else {
+    seeds.push(Buffer.alloc(32));
+  }
+  if (nameParent) {
+    seeds.push(nameParent.toBuffer());
+  } else {
+    seeds.push(Buffer.alloc(32));
+  }
+  const [nameAccountKey] = PublicKey.findProgramAddressSync(
+    seeds,
+    NAME_PROGRAM_ID
+  );
+  return nameAccountKey;
+};
+
+/**
+ * This function can be used to perform a reverse look up
+ * @param connection The Solana RPC connection
+ * @param nameAccount The public key of the domain to look up
+ * @returns The human readable domain name
+ */
+export async function reverseLookup(
+  connection: Connection,
+  nameAccount: PublicKey
+): Promise<string> {
+  const hashedReverseLookup = getHashedNameSync(nameAccount.toBase58());
+  const reverseLookupAccount = getNameAccountKeySync(
+    hashedReverseLookup,
+    REVERSE_LOOKUP_CLASS
+  );
+
+  const { registry } = await NameRegistryState.retrieve(
+    connection,
+    reverseLookupAccount
+  );
+  if (!registry.data) {
+    throw new SNSError(ErrorType.NoAccountData);
+  }
+  const nameLength = new BN(registry.data.slice(0, 4), "le").toNumber();
+  return registry.data.slice(4, 4 + nameLength).toString();
+}
+
+/**
+ * This function can be used to perform a reverse look up
+ * @param connection The Solana RPC connection
+ * @param nameAccount The public keys of the domains to look up
+ * @returns The human readable domain names
+ */
+export async function reverseLookupBatch(
+  connection: Connection,
+  nameAccounts: PublicKey[]
+): Promise<(string | undefined)[]> {
+  let reverseLookupAccounts: PublicKey[] = [];
+  for (let nameAccount of nameAccounts) {
+    const hashedReverseLookup = getHashedNameSync(nameAccount.toBase58());
+    const reverseLookupAccount = getNameAccountKeySync(
+      hashedReverseLookup,
+      REVERSE_LOOKUP_CLASS
+    );
+    reverseLookupAccounts.push(reverseLookupAccount);
+  }
+
+  let names = await NameRegistryState.retrieveBatch(
+    connection,
+    reverseLookupAccounts
+  );
+
+  return names.map((name) => {
+    if (name === undefined || name.data === undefined) {
+      return undefined;
+    }
+    let nameLength = new BN(name.data.slice(0, 4), "le").toNumber();
+    return name.data.slice(4, 4 + nameLength).toString();
+  });
+}
+
+/**
+ *
+ * @param connection The Solana RPC connection object
+ * @param parentKey The parent you want to find sub-domains for
+ * @returns
+ */
+export const findSubdomains = async (
+  connection: Connection,
+  parentKey: PublicKey
+): Promise<string[]> => {
+  // Fetch reverse accounts
+  const filtersReverse: MemcmpFilter[] = [
+    {
+      memcmp: {
+        offset: 0,
+        bytes: parentKey.toBase58(),
+      },
+    },
+    {
+      memcmp: {
+        offset: 64,
+        bytes: REVERSE_LOOKUP_CLASS.toBase58(),
+      },
+    },
+  ];
+  const reverse = await connection.getProgramAccounts(NAME_PROGRAM_ID, {
+    filters: filtersReverse,
+  });
+
+  const parent = await reverseLookup(connection, parentKey);
+  const subs = reverse.map((e) =>
+    e.account.data.slice(97).toString("utf-8")?.split("\0").join("")
+  );
+
+  const keys = subs.map((e) => getDomainKeySync(e + "." + parent).pubkey);
+  const subsAcc = await connection.getMultipleAccountsInfo(keys);
+
+  return subs.filter((_, idx) => !!subsAcc[idx]);
+};
+
+const _deriveSync = (name: string, parent: PublicKey = ROOT_DOMAIN_ACCOUNT) => {
+  let hashed = getHashedNameSync(name);
+  let pubkey = getNameAccountKeySync(hashed, undefined, parent);
+  return { pubkey, hashed };
+};
+
+/**
+ * This function can be used to compute the public key of a domain or subdomain
+ * @param domain The domain to compute the public key for (e.g `bonfida.sol`, `dex.bonfida.sol`)
+ * @param record Optional parameter: If the domain being resolved is a record
+ * @returns
+ */
+export const getDomainKeySync = (domain: string, record = false) => {
+  if (domain.endsWith(".sol")) {
+    domain = domain.slice(0, -4);
+  }
+  const splitted = domain.split(".");
+  if (splitted.length === 2) {
+    const prefix = Buffer.from([record ? 1 : 0]).toString();
+    const sub = prefix.concat(splitted[0]);
+    const { pubkey: parentKey } = _deriveSync(splitted[1]);
+    const result = _deriveSync(sub, parentKey);
+    return { ...result, isSub: true, parent: parentKey };
+  } else if (splitted.length === 3 && record) {
+    // Parent key
+    const { pubkey: parentKey } = _deriveSync(splitted[2]);
+    // Sub domain
+    const { pubkey: subKey } = _deriveSync("\0".concat(splitted[1]), parentKey);
+    // Sub record
+    const recordPrefix = Buffer.from([1]).toString();
+    const result = _deriveSync(recordPrefix.concat(splitted[0]), subKey);
+    return { ...result, isSub: true, parent: parentKey, isSubRecord: true };
+  } else if (splitted.length >= 3) {
+    throw new SNSError(ErrorType.InvalidInput);
+  }
+  const result = _deriveSync(domain, ROOT_DOMAIN_ACCOUNT);
+  return { ...result, isSub: false, parent: undefined };
+};
+
+/**
+ * This function can be used to retrieve all domain names owned by `wallet`
+ * @param connection The Solana RPC connection object
+ * @param wallet The wallet you want to search domain names for
+ * @returns
+ */
+export async function getAllDomains(
+  connection: Connection,
+  wallet: PublicKey
+): Promise<PublicKey[]> {
+  const filters = [
+    {
+      memcmp: {
+        offset: 32,
+        bytes: wallet.toBase58(),
+      },
+    },
+    {
+      memcmp: {
+        offset: 0,
+        bytes: ROOT_DOMAIN_ACCOUNT.toBase58(),
+      },
+    },
+  ];
+  const accounts = await connection.getProgramAccounts(NAME_PROGRAM_ID, {
+    filters,
+  });
+  return accounts.map((a) => a.pubkey);
+}
+
+/**
+ * This function can be used to retrieve all the registered `.sol` domains.
+ * The account data is sliced to avoid enormous payload and only the owner is returned
+ * @param connection The Solana RPC connection object
+ * @returns
+ */
+export const getAllRegisteredDomains = async (connection: Connection) => {
+  const filters = [
+    {
+      memcmp: {
+        offset: 0,
+        bytes: ROOT_DOMAIN_ACCOUNT.toBase58(),
+      },
+    },
+  ];
+  const dataSlice = { offset: 32, length: 32 };
+
+  const accounts = await connection.getProgramAccounts(NAME_PROGRAM_ID, {
+    dataSlice,
+    filters,
+  });
+  return accounts;
+};
+
+/**
+ * This function can be used to get the key of the reverse account
+ * @param domain The domain to compute the reverse for
+ * @param isSub Whether the domain is a subdomain or not
+ * @returns The public key of the reverse account
+ */
+export const getReverseKeySync = (domain: string, isSub?: boolean) => {
+  const { pubkey, parent } = getDomainKeySync(domain);
+  const hashedReverseLookup = getHashedNameSync(pubkey.toBase58());
+  const reverseLookupAccount = getNameAccountKeySync(
+    hashedReverseLookup,
+    REVERSE_LOOKUP_CLASS,
+    isSub ? parent : undefined
+  );
+  return reverseLookupAccount;
+};
+
+export const check = (bool: boolean, errorType: ErrorType) => {
+  if (!bool) {
+    throw new SNSError(errorType);
+  }
+};
+
+import { Connection, PublicKey } from "@solana/web3.js";
+/**
+ * This function can be used to verify the validity of a SOL record
+ * @param record The record data to verify
+ * @param signedRecord The signed data
+ * @param pubkey The public key of the signer
+ * @returns
+ */
+export declare const checkSolRecord: (record: Uint8Array, signedRecord: Uint8Array, pubkey: PublicKey) => boolean;
+/**
+ * This function can be used to resolve a domain name to transfer funds
+ * @param connection The Solana RPC connection object
+ * @param domain The domain to resolve
+ * @returns
+ */
+export declare const resolve: (connection: Connection, domain: string) => Promise<PublicKey>;
+
+import { PublicKey } from "@solana/web3.js";
+/**
+ * The Solana Name Service program ID
+ */
+export declare const NAME_PROGRAM_ID: PublicKey;
+/**
+ * Hash prefix used to derive domain name addresses
+ */
+export declare const HASH_PREFIX = "SPL Name Service";
+/**
+ * The `.sol` TLD
+ */
+export declare const ROOT_DOMAIN_ACCOUNT: PublicKey;
+/**
+ * The Registry program ID
+ */
+export declare const REGISTER_PROGRAM_ID: PublicKey;
+/**
+ * The FIDA Pyth price feed
+ */
+export declare const PYTH_FIDA_PRICE_ACC: PublicKey;
+/**
+ * The FIDA buy and burn address
+ */
+export declare const BONFIDA_FIDA_BNB: PublicKey;
+/**
+ * The reverse look up class
+ */
+export declare const REVERSE_LOOKUP_CLASS: PublicKey;
+/**
+ * The `.twitter` TLD authority
+ */
+export declare const TWITTER_VERIFICATION_AUTHORITY: PublicKey;
+/**
+ * The `.twitter` TLD
+ */
+export declare const TWITTER_ROOT_PARENT_REGISTRY_KEY: PublicKey;
+/**
+ * The length of the SOL record signature
+ */
+export declare const SOL_RECORD_SIG_LEN = 96;
+export declare const BONFIDA_USDC_BNB: PublicKey;
+export declare const USDC_MINT: PublicKey;
+export declare const REFERRERS: PublicKey[];
+export declare const TOKENS_SYM_MINT: Map<string, string>;
+export declare const PYTH_MAPPING_ACC: PublicKey;
+export declare const VAULT_OWNER: PublicKey;
+
+export declare enum ErrorType {
+    SymbolNotFound = "SymbolNotFound",
+    InvalidSubdomain = "InvalidSubdomain",
+    FavouriteDomainNotFound = "FavouriteDomainNotFound",
+    MissingParentOwner = "MissingParentOwner",
+    U32Overflow = "U32Overflow",
+    InvalidBufferLength = "InvalidBufferLength",
+    U64Overflow = "U64Overflow",
+    NoRecordData = "NoRecordData",
+    InvalidRecordData = "InvalidRecordData",
+    UnsupportedRecord = "UnsupportedRecord",
+    InvalidEvmAddress = "InvalidEvmAddress",
+    InvalidInjectiveAddress = "InvalidInjectiveAddress",
+    InvalidARecord = "InvalidARecord",
+    InvalidAAAARecord = "InvalidAAAARecord",
+    InvalidRecordInput = "InvalidRecordInput",
+    InvalidSignature = "InvalidSignature",
+    AccountDoesNotExist = "AccountDoesNotExist",
+    MultipleRegistries = "MultipleRegistries",
+    InvalidReverseTwitter = "InvalidReverseTwitter",
+    NoAccountData = "NoAccountData",
+    InvalidInput = "InvalidInput"
+}
+export declare class SNSError extends Error {
+    type: ErrorType;
+    constructor(type: ErrorType, message?: string);
+}
+
+/// <reference types="node" />
+import { Buffer } from "buffer";
+import { Connection, PublicKey, TransactionInstruction } from "@solana/web3.js";
+import { Record } from "./types/record";
+/**
+ * Creates a name account with the given rent budget, allocated space, owner and class.
+ *
+ * @param connection The solana connection object to the RPC node
+ * @param name The name of the new account
+ * @param space The space in bytes allocated to the account
+ * @param payerKey The allocation cost payer
+ * @param nameOwner The pubkey to be set as owner of the new name account
+ * @param lamports The budget to be set for the name account. If not specified, it'll be the minimum for rent exemption
+ * @param nameClass The class of this new name
+ * @param parentName The parent name of the new name. If specified its owner needs to sign
+ * @returns
+ */
+export declare function createNameRegistry(connection: Connection, name: string, space: number, payerKey: PublicKey, nameOwner: PublicKey, lamports?: number, nameClass?: PublicKey, parentName?: PublicKey): Promise<TransactionInstruction>;
+/**
+ * Overwrite the data of the given name registry.
+ *
+ * @param connection The solana connection object to the RPC node
+ * @param name The name of the name registry to update
+ * @param offset The offset to which the data should be written into the registry
+ * @param input_data The data to be written
+ * @param nameClass The class of this name, if it exsists
+ * @param nameParent The parent name of this name, if it exists
+ */
+export declare function updateNameRegistryData(connection: Connection, name: string, offset: number, input_data: Buffer, nameClass?: PublicKey, nameParent?: PublicKey): Promise<TransactionInstruction>;
+/**
+ * Change the owner of a given name account.
+ *
+ * @param connection The solana connection object to the RPC node
+ * @param name The name of the name account
+ * @param newOwner The new owner to be set
+ * @param nameClass The class of this name, if it exsists
+ * @param nameParent The parent name of this name, if it exists
+ * @param parentOwner Parent name owner
+ * @returns
+ */
+export declare function transferNameOwnership(connection: Connection, name: string, newOwner: PublicKey, nameClass?: PublicKey, nameParent?: PublicKey, parentOwner?: PublicKey): Promise<TransactionInstruction>;
+/**
+ * Delete the name account and transfer the rent to the target.
+ *
+ * @param connection The solana connection object to the RPC node
+ * @param name The name of the name account
+ * @param refundTargetKey The refund destination address
+ * @param nameClass The class of this name, if it exsists
+ * @param nameParent The parent name of this name, if it exists
+ * @returns
+ */
+export declare function deleteNameRegistry(connection: Connection, name: string, refundTargetKey: PublicKey, nameClass?: PublicKey, nameParent?: PublicKey): Promise<TransactionInstruction>;
+/**
+ * This function can be used to register a .sol domain
+ * @param connection The Solana RPC connection object
+ * @param name The domain name to register e.g bonfida if you want to register bonfida.sol
+ * @param space The domain name account size (max 10kB)
+ * @param buyer The public key of the buyer
+ * @param buyerTokenAccount The buyer token account (USDC)
+ * @param mint Optional mint used to purchase the domain, defaults to USDC
+ * @param referrerKey Optional referrer key
+ * @returns
+ */
+export declare const registerDomainName: (connection: Connection, name: string, space: number, buyer: PublicKey, buyerTokenAccount: PublicKey, mint?: PublicKey, referrerKey?: PublicKey) => Promise<TransactionInstruction[][]>;
+/**
+ *
+ * @param nameAccount The name account to create the reverse account for
+ * @param name The name of the domain
+ * @param feePayer The fee payer of the transaction
+ * @param parentName The parent name account
+ * @param parentNameOwner The parent name owner
+ * @returns
+ */
+export declare const createReverseName: (nameAccount: PublicKey, name: string, feePayer: PublicKey, parentName?: PublicKey, parentNameOwner?: PublicKey) => Promise<TransactionInstruction[][]>;
+/**
+ * This function can be used to create a subdomain
+ * @param connection The Solana RPC connection object
+ * @param subdomain The subdomain to create with or without .sol e.g something.bonfida.sol or something.bonfida
+ * @param owner The owner of the parent domain creating the subdomain
+ * @param space The space to allocate to the subdomain (defaults to 2kb)
+ */
+export declare const createSubdomain: (connection: Connection, subdomain: string, owner: PublicKey, space?: number) => Promise<TransactionInstruction[][]>;
+/**
+ * This function can be used be create a record, it handles the serialization of the record data
+ * To create a SOL record use `createSolRecordInstruction`
+ * @param connection The Solana RPC connection object
+ * @param domain The .sol domain name
+ * @param record The record enum object
+ * @param data The data (as a UTF-8 string) to store in the record account
+ * @param owner The owner of the domain
+ * @param payer The fee payer of the transaction
+ * @returns
+ */
+export declare const createRecordInstruction: (connection: Connection, domain: string, record: Record, data: string, owner: PublicKey, payer: PublicKey) => Promise<TransactionInstruction>;
+export declare const updateRecordInstruction: (connection: Connection, domain: string, record: Record, data: string, owner: PublicKey, payer: PublicKey) => Promise<TransactionInstruction[]>;
+/**
+ * This function can be used to create a SOL record
+ * @param connection The Solana RPC connection object
+ * @param domain The .sol domain name
+ * @param content The content of the SOL record i.e the public key to store as destination of the domain
+ * @param signer The signer of the SOL record i.e the owner of the domain
+ * @param signature The signature of the record
+ * @param payer The fee payer of the transaction
+ * @returns
+ */
+export declare const createSolRecordInstruction: (connection: Connection, domain: string, content: PublicKey, signer: PublicKey, signature: Uint8Array, payer: PublicKey) => Promise<TransactionInstruction[]>;
+export declare const updateSolRecordInstruction: (connection: Connection, domain: string, content: PublicKey, signer: PublicKey, signature: Uint8Array, payer: PublicKey) => Promise<(TransactionInstruction | TransactionInstruction[])[]>;
+
+/// <reference types="node" />
+import { Connection, PublicKey } from "@solana/web3.js";
+import { Schema } from "borsh";
+import { Buffer } from "buffer";
+export declare class NameRegistryState {
+    static HEADER_LEN: number;
+    parentName: PublicKey;
+    owner: PublicKey;
+    class: PublicKey;
+    data: Buffer | undefined;
+    static schema: Schema;
+    constructor(obj: {
+        parentName: Uint8Array;
+        owner: Uint8Array;
+        class: Uint8Array;
+    });
+    static retrieve(connection: Connection, nameAccountKey: PublicKey): Promise<{
+        registry: NameRegistryState;
+        nftOwner: PublicKey | undefined;
+    }>;
+    static _retrieveBatch(connection: Connection, nameAccountKeys: PublicKey[]): Promise<(NameRegistryState | undefined)[]>;
+    static retrieveBatch(connection: Connection, nameAccountKeys: PublicKey[]): Promise<(NameRegistryState | undefined)[]>;
+}
+export declare class TokenData {
+    name: string;
+    ticker: string;
+    mint: Uint8Array;
+    decimals: number;
+    website?: string;
+    logoUri?: string;
+    constructor(obj: {
+        name: string;
+        ticker: string;
+        mint: Uint8Array;
+        decimals: number;
+        website?: string;
+        logoUri?: string;
+    });
+    static schema: Schema;
+    serialize(): Uint8Array;
+    static deserialize(data: Buffer): TokenData;
+}
+export declare class Mint {
+    mint: Uint8Array;
+    constructor(obj: {
+        mint: Uint8Array;
+    });
+    static schema: Schema;
+    serialize(): Uint8Array;
+    static deserialize(data: Buffer): Mint;
+}
+
+import { Record } from "./types/record";
+import { Connection, PublicKey } from "@solana/web3.js";
+import { NameRegistryState } from "./state";
+import { Buffer } from "buffer";
+/**
+ * This function can be used to derive a record key
+ * @param domain The .sol domain name
+ * @param record The record to derive the key for
+ * @returns
+ */
+export declare const getRecordKeySync: (domain: string, record: Record) => PublicKey;
+export declare function getRecord(connection: Connection, domain: string, record: Record, deserialize: true): Promise<string | undefined>;
+export declare function getRecord(connection: Connection, domain: string, record: Record, deserialize?: false): Promise<NameRegistryState | undefined>;
+export declare function getRecords(connection: Connection, domain: string, records: Record[], deserialize: true): Promise<string[]>;
+export declare function getRecords(connection: Connection, domain: string, records: Record[], deserialize?: false): Promise<NameRegistryState[]>;
+/**
+ * This function can be used to retrieve the IPFS record of a domain name
+ * @param connection The Solana RPC connection object
+ * @param domain The .sol domain name
+ * @returns
+ */
+export declare const getIpfsRecord: (connection: Connection, domain: string) => Promise<string | undefined>;
+/**
+ * This function can be used to retrieve the Arweave record of a domain name
+ * @param connection The Solana RPC connection object
+ * @param domain The .sol domain name
+ * @returns
+ */
+export declare const getArweaveRecord: (connection: Connection, domain: string) => Promise<string | undefined>;
+/**
+ * This function can be used to retrieve the ETH record of a domain name
+ * @param connection The Solana RPC connection object
+ * @param domain The .sol domain name
+ * @returns
+ */
+export declare const getEthRecord: (connection: Connection, domain: string) => Promise<string | undefined>;
+/**
+ * This function can be used to retrieve the BTC record of a domain name
+ * @param connection The Solana RPC connection object
+ * @param domain The .sol domain name
+ * @returns
+ */
+export declare const getBtcRecord: (connection: Connection, domain: string) => Promise<string | undefined>;
+/**
+ * This function can be used to retrieve the LTC record of a domain name
+ * @param connection The Solana RPC connection object
+ * @param domain The .sol domain name
+ * @returns
+ */
+export declare const getLtcRecord: (connection: Connection, domain: string) => Promise<string | undefined>;
+/**
+ * This function can be used to retrieve the DOGE record of a domain name
+ * @param connection The Solana RPC connection object
+ * @param domain The .sol domain name
+ * @returns
+ */
+export declare const getDogeRecord: (connection: Connection, domain: string) => Promise<string | undefined>;
+/**
+ * This function can be used to retrieve the email record of a domain name
+ * @param connection The Solana RPC connection object
+ * @param domain The .sol domain name
+ * @returns
+ */
+export declare const getEmailRecord: (connection: Connection, domain: string) => Promise<string | undefined>;
+/**
+ * This function can be used to retrieve the URL record of a domain name
+ * @param connection The Solana RPC connection object
+ * @param domain The .sol domain name
+ * @returns
+ */
+export declare const getUrlRecord: (connection: Connection, domain: string) => Promise<string | undefined>;
+/**
+ * This function can be used to retrieve the Discord record of a domain name
+ * @param connection The Solana RPC connection object
+ * @param domain The .sol domain name
+ * @returns
+ */
+export declare const getDiscordRecord: (connection: Connection, domain: string) => Promise<string | undefined>;
+/**
+ * This function can be used to retrieve the Github record of a domain name
+ * @param connection The Solana RPC connection object
+ * @param domain The .sol domain name
+ * @returns
+ */
+export declare const getGithubRecord: (connection: Connection, domain: string) => Promise<string | undefined>;
+/**
+ * This function can be used to retrieve the Reddit record of a domain name
+ * @param connection The Solana RPC connection object
+ * @param domain The .sol domain name
+ * @returns
+ */
+export declare const getRedditRecord: (connection: Connection, domain: string) => Promise<string | undefined>;
+/**
+ * This function can be used to retrieve the Twitter record of a domain name
+ * @param connection The Solana RPC connection object
+ * @param domain The .sol domain name
+ * @returns
+ */
+export declare const getTwitterRecord: (connection: Connection, domain: string) => Promise<string | undefined>;
+/**
+ * This function can be used to retrieve the Telegram record of a domain name
+ * @param connection The Solana RPC connection object
+ * @param domain The .sol domain name
+ * @returns
+ */
+export declare const getTelegramRecord: (connection: Connection, domain: string) => Promise<string | undefined>;
+/**
+ * This function can be used to retrieve the pic record of a domain name
+ * @param connection The Solana RPC connection object
+ * @param domain The .sol domain name
+ * @returns
+ */
+export declare const getPicRecord: (connection: Connection, domain: string) => Promise<string | undefined>;
+/**
+ * This function can be used to retrieve the SHDW record of a domain name
+ * @param connection The Solana RPC connection object
+ * @param domain The .sol domain name
+ * @returns
+ */
+export declare const getShdwRecord: (connection: Connection, domain: string) => Promise<string | undefined>;
+/**
+ * This function can be used to retrieve the SOL record of a domain name
+ * @param connection The Solana RPC connection object
+ * @param domain The .sol domain name
+ * @returns
+ */
+export declare const getSolRecord: (connection: Connection, domain: string) => Promise<NameRegistryState | undefined>;
+/**
+ * This function can be used to retrieve the POINT record of a domain name
+ * @param connection The Solana RPC connection object
+ * @param domain The .sol domain name
+ * @returns
+ */
+export declare const getPointRecord: (connection: Connection, domain: string) => Promise<string | undefined>;
+/**
+ * This function can be used to retrieve the BSC record of a domain name
+ * @param connection The Solana RPC connection object
+ * @param domain The .sol domain name
+ * @returns
+ */
+export declare const getBscRecord: (connection: Connection, domain: string) => Promise<string | undefined>;
+/**
+ * This function can be used to retrieve the Injective record of a domain name
+ * @param connection The Solana RPC connection object
+ * @param domain The .sol domain name
+ * @returns
+ */
+export declare const getInjectiveRecord: (connection: Connection, domain: string) => Promise<string | undefined>;
+/**
+ * This function can be used to retrieve the Backpack record of a domain name
+ * @param connection The Solana RPC connection object
+ * @param domain The .sol domain name
+ * @returns
+ */
+export declare const getBackpackRecord: (connection: Connection, domain: string) => Promise<string | undefined>;
+/**
+ * This function can be used to deserialize the content of a record. If the content is invalid it will throw an error
+ * @param registry The name registry state object of the record being deserialized
+ * @param record The record enum being deserialized
+ * @param recordKey The public key of the record being deserialized
+ * @returns
+ */
+export declare const deserializeRecord: (registry: NameRegistryState | undefined, record: Record, recordKey: PublicKey) => string | undefined;
+/**
+ * This function can be used to serialize a user input string into a buffer that will be stored into a record account data
+ * For serializing SOL records use `serializeSolRecord`
+ * @param str The string being serialized into the record account data
+ * @param record The record enum being serialized
+ * @returns
+ */
+export declare const serializeRecord: (str: string, record: Record) => Buffer;
+/**
+ * This function can be used to build the content of a SOL record
+ * @param content The public key being stored in the SOL record
+ * @param recordKey The record public key
+ * @param signer The signer of the record i.e the domain owner
+ * @param signature The signature of the record's content
+ * @returns
+ */
+export declare const serializeSolRecord: (content: PublicKey, recordKey: PublicKey, signer: PublicKey, signature: Uint8Array) => Buffer;
+
+/// <reference types="node" />
+import { Buffer } from "buffer";
+import { PublicKey, TransactionInstruction } from "@solana/web3.js";
+import { Numberu32, Numberu64 } from "./int";
+import { Schema } from "borsh";
+export interface AccountKey {
+    pubkey: PublicKey;
+    isSigner: boolean;
+    isWritable: boolean;
+}
+export declare function createInstruction(nameProgramId: PublicKey, systemProgramId: PublicKey, nameKey: PublicKey, nameOwnerKey: PublicKey, payerKey: PublicKey, hashed_name: Buffer, lamports: Numberu64, space: Numberu32, nameClassKey?: PublicKey, nameParent?: PublicKey, nameParentOwner?: PublicKey): TransactionInstruction;
+export declare function updateInstruction(nameProgramId: PublicKey, nameAccountKey: PublicKey, offset: Numberu32, input_data: Buffer, nameUpdateSigner: PublicKey): TransactionInstruction;
+export declare function transferInstruction(nameProgramId: PublicKey, nameAccountKey: PublicKey, newOwnerKey: PublicKey, currentNameOwnerKey: PublicKey, nameClassKey?: PublicKey, nameParent?: PublicKey, parentOwner?: PublicKey): TransactionInstruction;
+export declare function deleteInstruction(nameProgramId: PublicKey, nameAccountKey: PublicKey, refundTargetKey: PublicKey, nameOwnerKey: PublicKey): TransactionInstruction;
+export declare class createV2Instruction {
+    tag: number;
+    name: string;
+    space: number;
+    static schema: Schema;
+    constructor(obj: {
+        name: string;
+        space: number;
+    });
+    serialize(): Uint8Array;
+    getInstruction(programId: PublicKey, rentSysvarAccount: PublicKey, nameProgramId: PublicKey, rootDomain: PublicKey, nameAccount: PublicKey, reverseLookupAccount: PublicKey, centralState: PublicKey, buyer: PublicKey, buyerTokenAccount: PublicKey, usdcVault: PublicKey, state: PublicKey): TransactionInstruction;
+}
+export declare class createReverseInstruction {
+    tag: number;
+    name: string;
+    static schema: Schema;
+    constructor(obj: {
+        name: string;
+    });
+    serialize(): Uint8Array;
+    getInstruction(programId: PublicKey, rentSysvarAccount: PublicKey, namingServiceProgram: PublicKey, rootDomain: PublicKey, reverseLookupAccount: PublicKey, centralStateAccount: PublicKey, feePayer: PublicKey, parentName?: PublicKey, parentNameOwner?: PublicKey): TransactionInstruction;
+}
+export declare class createInstructionV3 {
+    tag: number;
+    name: string;
+    space: number;
+    referrerIdxOpt: number | null;
+    static schema: Schema;
+    constructor(obj: {
+        name: string;
+        space: number;
+        referrerIdxOpt: number | null;
+    });
+    serialize(): Uint8Array;
+    getInstruction(programId: PublicKey, namingServiceProgram: PublicKey, rootDomain: PublicKey, name: PublicKey, reverseLookup: PublicKey, systemProgram: PublicKey, centralState: PublicKey, buyer: PublicKey, buyerTokenSource: PublicKey, pythMappingAcc: PublicKey, pythProductAcc: PublicKey, pythPriceAcc: PublicKey, vault: PublicKey, splTokenProgram: PublicKey, rentSysvar: PublicKey, state: PublicKey, referrerAccountOpt?: PublicKey): TransactionInstruction;
+}
+
+/// <reference types="node" />
+import { Connection, PublicKey, TransactionInstruction } from "@solana/web3.js";
+import { NameRegistryState } from "./state";
+import { Schema } from "borsh";
+import { Buffer } from "buffer";
+export declare function createVerifiedTwitterRegistry(connection: Connection, twitterHandle: string, verifiedPubkey: PublicKey, space: number, // The space that the user will have to write data into the verified registry
+payerKey: PublicKey): Promise<TransactionInstruction[]>;
+export declare function changeTwitterRegistryData(twitterHandle: string, verifiedPubkey: PublicKey, offset: number, // The offset at which to write the input data into the NameRegistryData
+input_data: Buffer): Promise<TransactionInstruction[]>;
+export declare function changeVerifiedPubkey(connection: Connection, twitterHandle: string, currentVerifiedPubkey: PublicKey, newVerifiedPubkey: PublicKey, payerKey: PublicKey): Promise<TransactionInstruction[]>;
+export declare function deleteTwitterRegistry(twitterHandle: string, verifiedPubkey: PublicKey): Promise<TransactionInstruction[]>;
+export declare function getTwitterRegistryKey(twitter_handle: string): Promise<PublicKey>;
+export declare function getTwitterRegistry(connection: Connection, twitter_handle: string): Promise<NameRegistryState>;
+export declare function getHandleAndRegistryKey(connection: Connection, verifiedPubkey: PublicKey): Promise<[string, PublicKey]>;
+export declare function getTwitterHandleandRegistryKeyViaFilters(connection: Connection, verifiedPubkey: PublicKey): Promise<[string, PublicKey]>;
+export declare function getTwitterRegistryData(connection: Connection, verifiedPubkey: PublicKey): Promise<Buffer>;
+export declare class ReverseTwitterRegistryState {
+    twitterRegistryKey: Uint8Array;
+    twitterHandle: string;
+    static schema: Schema;
+    constructor(obj: {
+        twitterRegistryKey: Uint8Array;
+        twitterHandle: string;
+    });
+    static retrieve(connection: Connection, reverseTwitterAccountKey: PublicKey): Promise<ReverseTwitterRegistryState>;
+}
+export declare function createReverseTwitterRegistry(connection: Connection, twitterHandle: string, twitterRegistryKey: PublicKey, verifiedPubkey: PublicKey, payerKey: PublicKey): Promise<TransactionInstruction[]>;
+
+/// <reference types="node" />
+import { Connection, PublicKey } from "@solana/web3.js";
+import { Buffer } from "buffer";
+import { ErrorType } from "./error";
+export declare const getHashedNameSync: (name: string) => Buffer;
+export declare const getNameAccountKeySync: (hashed_name: Buffer, nameClass?: PublicKey, nameParent?: PublicKey) => PublicKey;
+/**
+ * This function can be used to perform a reverse look up
+ * @param connection The Solana RPC connection
+ * @param nameAccount The public key of the domain to look up
+ * @returns The human readable domain name
+ */
+export declare function reverseLookup(connection: Connection, nameAccount: PublicKey): Promise<string>;
+/**
+ * This function can be used to perform a reverse look up
+ * @param connection The Solana RPC connection
+ * @param nameAccount The public keys of the domains to look up
+ * @returns The human readable domain names
+ */
+export declare function reverseLookupBatch(connection: Connection, nameAccounts: PublicKey[]): Promise<(string | undefined)[]>;
+/**
+ *
+ * @param connection The Solana RPC connection object
+ * @param parentKey The parent you want to find sub-domains for
+ * @returns
+ */
+export declare const findSubdomains: (connection: Connection, parentKey: PublicKey) => Promise<string[]>;
+/**
+ * This function can be used to compute the public key of a domain or subdomain
+ * @param domain The domain to compute the public key for (e.g `bonfida.sol`, `dex.bonfida.sol`)
+ * @param record Optional parameter: If the domain being resolved is a record
+ * @returns
+ */
+export declare const getDomainKeySync: (domain: string, record?: boolean) => {
+    isSub: boolean;
+    parent: PublicKey;
+    pubkey: PublicKey;
+    hashed: Buffer;
+} | {
+    isSub: boolean;
+    parent: PublicKey;
+    isSubRecord: boolean;
+    pubkey: PublicKey;
+    hashed: Buffer;
+} | {
+    isSub: boolean;
+    parent: undefined;
+    pubkey: PublicKey;
+    hashed: Buffer;
+};
+/**
+ * This function can be used to retrieve all domain names owned by `wallet`
+ * @param connection The Solana RPC connection object
+ * @param wallet The wallet you want to search domain names for
+ * @returns
+ */
+export declare function getAllDomains(connection: Connection, wallet: PublicKey): Promise<PublicKey[]>;
+/**
+ * This function can be used to retrieve all the registered `.sol` domains.
+ * The account data is sliced to avoid enormous payload and only the owner is returned
+ * @param connection The Solana RPC connection object
+ * @returns
+ */
+export declare const getAllRegisteredDomains: (connection: Connection) => Promise<import("@solana/web3.js").GetProgramAccountsResponse>;
+/**
+ * This function can be used to get the key of the reverse account
+ * @param domain The domain to compute the reverse for
+ * @param isSub Whether the domain is a subdomain or not
+ * @returns The public key of the reverse account
+ */
+export declare const getReverseKeySync: (domain: string, isSub?: boolean) => PublicKey;
+export declare const check: (bool: boolean, errorType: ErrorType) => void;
+
+/// <reference types="node" />
+import { Buffer } from "buffer";
+import BN from "bn.js";
+export declare class Numberu32 extends BN {
+    /**
+     * Convert to Buffer representation
+     */
+    toBuffer(): Buffer;
+    /**
+     * Construct a Numberu64 from Buffer representation
+     */
+    static fromBuffer(buffer: any): BN;
+}
+export declare class Numberu64 extends BN {
+    /**
+     * Convert to Buffer representation
+     */
+    toBuffer(): Buffer;
+    /**
+     * Construct a Numberu64 from Buffer representation
+     */
+    static fromBuffer(buffer: any): BN;
+}
+
+export * from "./bindings";
+export * from "./state";
+export * from "./twitter_bindings";
+export * from "./deprecated/tokens";
+export * from "./utils";
+export * from "./instructions";
+export * from "./nft";
+export * from "./favorite-domain";
+export * from "./constants";
+export * from "./int";
+export * from "./record";
+export * from "./types/record";
+export * from "./resolve";
+export * from "./deprecated/utils";
+export * from "./error";
+
+/// <reference types="node" />
+import { Buffer } from "buffer";
+import { Schema } from "borsh";
+import { PublicKey, Connection } from "@solana/web3.js";
+export declare const NAME_OFFERS_ID: PublicKey;
+export declare class FavouriteDomain {
+    tag: number;
+    nameAccount: PublicKey;
+    static schema: Schema;
+    constructor(obj: {
+        tag: number;
+        nameAccount: Uint8Array;
+    });
+    /**
+     * This function can be used to deserialize a Buffer into a FavouriteDomain object
+     * @param data The buffer to deserialize
+     * @returns
+     */
+    static deserialize(data: Buffer): FavouriteDomain;
+    /**
+     * This function can be used to retrieve and deserialize a favorite domain
+     * @param connection The Solana RPC connection object
+     * @param key The favorite account key
+     * @returns
+     */
+    static retrieve(connection: Connection, key: PublicKey): Promise<FavouriteDomain>;
+    /**
+     * This function can be used to derive the key of a favorite domain
+     * @param programId The name offer program ID
+     * @param owner The owner to retrieve the favorite domain for
+     * @returns
+     */
+    static getKey(programId: PublicKey, owner: PublicKey): Promise<[PublicKey, number]>;
+    /**
+     * This function can be used to derive the key of a favorite domain
+     * @param programId The name offer program ID
+     * @param owner The owner to retrieve the favorite domain for
+     * @returns
+     */
+    static getKeySync(programId: PublicKey, owner: PublicKey): [PublicKey, number];
+}
+/**
+ * This function can be used to retrieve the favorite domain of a user
+ * @param connection The Solana RPC connection object
+ * @param owner The owner you want to retrieve the favorite domain for
+ * @returns
+ */
+export declare const getFavoriteDomain: (connection: Connection, owner: PublicKey) => Promise<{
+    domain: PublicKey;
+    reverse: string;
+}>;
+
+/**
+ * List of SNS Records
+ */
+export declare enum Record {
+    IPFS = "IPFS",
+    ARWV = "ARWV",
+    SOL = "SOL",
+    ETH = "ETH",
+    BTC = "BTC",
+    LTC = "LTC",
+    DOGE = "DOGE",
+    Email = "email",
+    Url = "url",
+    Discord = "discord",
+    Github = "github",
+    Reddit = "reddit",
+    Twitter = "twitter",
+    Telegram = "telegram",
+    Pic = "pic",
+    SHDW = "SHDW",
+    POINT = "POINT",
+    BSC = "BSC",
+    Injective = "INJ",
+    Backpack = "backpack",
+    A = "A",
+    AAAA = "AAAA",
+    CNAME = "CNAME",
+    TXT = "TXT"
+}
+export declare const RECORD_V1_SIZE: Map<Record, number>;
+
+/// <reference types="node" />
+import { Schema } from "borsh";
+import { Connection, PublicKey } from "@solana/web3.js";
+import { Buffer } from "buffer";
+export declare const NAME_TOKENIZER_ID: PublicKey;
+export declare const MINT_PREFIX: Buffer;
+export declare enum Tag {
+    Uninitialized = 0,
+    CentralState = 1,
+    ActiveRecord = 2,
+    InactiveRecord = 3
+}
+export declare class NftRecord {
+    tag: Tag;
+    nonce: number;
+    nameAccount: PublicKey;
+    owner: PublicKey;
+    nftMint: PublicKey;
+    static schema: Schema;
+    constructor(obj: {
+        tag: number;
+        nonce: number;
+        nameAccount: Uint8Array;
+        owner: Uint8Array;
+        nftMint: Uint8Array;
+    });
+    static deserialize(data: Buffer): NftRecord;
+    static retrieve(connection: Connection, key: PublicKey): Promise<NftRecord>;
+    static findKey(nameAccount: PublicKey, programId: PublicKey): Promise<[PublicKey, number]>;
+}
+/**
+ * This function can be used to retrieve a NFT Record given a mint
+ *
+ * @param connection A solana RPC connection
+ * @param mint The mint of the NFT Record
+ * @returns
+ */
+export declare const getRecordFromMint: (connection: Connection, mint: PublicKey) => Promise<import("@solana/web3.js").GetProgramAccountsResponse>;
+
+import { PublicKey, Connection } from "@solana/web3.js";
+/**
+ * This function can be used to retrieve the owner of a tokenized domain name
+ *
+ * @param connection The solana connection object to the RPC node
+ * @param nameAccount The key of the domain name
+ * @returns
+ */
+export declare const retrieveNftOwner: (connection: Connection, nameAccount: PublicKey) => Promise<PublicKey | undefined>;
+/**
+ * This function can be used to retrieve all the tokenized domains name
+ *
+ * @param connection The solana connection object to the RPC node
+ * @returns
+ */
+export declare const retrieveNfts: (connection: Connection) => Promise<PublicKey[]>;
+/**
+ * This function can be used to retrieve all the tokenized domains of an owner
+ * @param connection The Solana RPC connection object
+ * @param owner The owner of the tokenized domains
+ * @returns
+ */
+export declare const getTokenizedDomains: (connection: Connection, owner: PublicKey) => Promise<{
+    key: PublicKey;
+    mint: PublicKey;
+    reverse: string | undefined;
+}[]>;
+
+import { test, jest, expect } from "@jest/globals";
+import { reverseLookupBatch, reverseLookup } from "../src/utils";
+import { Connection, clusterApiUrl, PublicKey } from "@solana/web3.js";
+import { performReverseLookupBatch } from "../src/deprecated/utils";
+
+jest.setTimeout(5_000);
+
+const connection = new Connection(clusterApiUrl("mainnet-beta"));
+const domain = new PublicKey("Crf8hzfthWGbGbLTVCiqRqV5MVnbpHB1L9KQMd6gsinb");
+
+test("Reverse lookup", async () => {
+  performReverseLookupBatch(connection, [domain]).then((e) =>
+    expect(e).toStrictEqual(["bonfida"])
+  );
+  reverseLookupBatch(connection, [domain]).then((e) =>
+    expect(e).toStrictEqual(["bonfida"])
+  );
+  reverseLookup(connection, domain).then((e) => expect(e).toBe("bonfida"));
+});
+
+import { test, jest } from "@jest/globals";
+import { Connection, PublicKey, Transaction } from "@solana/web3.js";
+import { registerDomainName } from "../src/bindings";
+import { randomBytes } from "crypto";
+import { REFERRERS, USDC_MINT, VAULT_OWNER } from "../src/constants";
+import { getAssociatedTokenAddressSync } from "@solana/spl-token";
+
+jest.setTimeout(20_000);
+const FIDA_MINT = new PublicKey("EchesyfXePKdLtoiZSL8pBe8Myagyy8ZRqsACNCFGnvp");
+
+const connection = new Connection("https://rpc-public.hellomoon.io");
+
+test("Registration", async () => {
+  const tx = new Transaction();
+  const [, ix] = await registerDomainName(
+    connection,
+    randomBytes(10).toString("hex"),
+    1_000,
+    VAULT_OWNER,
+    getAssociatedTokenAddressSync(USDC_MINT, VAULT_OWNER),
+    USDC_MINT
+  );
+  tx.add(...ix);
+  const { blockhash } = await connection.getLatestBlockhash();
+  tx.recentBlockhash = blockhash;
+  tx.feePayer = VAULT_OWNER;
+  const res = await connection.simulateTransaction(tx);
+  expect(res.value.err).toBe(null);
+});
+
+test("Registration with ref", async () => {
+  const tx = new Transaction();
+  const [, ix] = await registerDomainName(
+    connection,
+    randomBytes(10).toString("hex"),
+    1_000,
+    VAULT_OWNER,
+    getAssociatedTokenAddressSync(FIDA_MINT, VAULT_OWNER),
+    FIDA_MINT,
+    REFERRERS[1]
+  );
+  tx.add(...ix);
+  const { blockhash } = await connection.getLatestBlockhash();
+  tx.recentBlockhash = blockhash;
+  tx.feePayer = VAULT_OWNER;
+  const res = await connection.simulateTransaction(tx);
+  expect(res.value.err).toBe(null);
+});
+
+import { test, expect } from "@jest/globals";
+import { getDomainKey } from "../src/deprecated/utils";
+import { getDomainKeySync } from "../src/utils";
+
+const items = [
+  {
+    domain: "bonfida",
+    address: "Crf8hzfthWGbGbLTVCiqRqV5MVnbpHB1L9KQMd6gsinb",
+  },
+  {
+    domain: "bonfida.sol",
+    address: "Crf8hzfthWGbGbLTVCiqRqV5MVnbpHB1L9KQMd6gsinb",
+  },
+  {
+    domain: "dex.bonfida",
+    address: "HoFfFXqFHAC8RP3duuQNzag1ieUwJRBv1HtRNiWFq4Qu",
+  },
+  {
+    domain: "dex.bonfida.sol",
+    address: "HoFfFXqFHAC8RP3duuQNzag1ieUwJRBv1HtRNiWFq4Qu",
+  },
+];
+
+test("Derivation", async () => {
+  for (let item of items) {
+    const { pubkey } = await getDomainKey(item.domain);
+    expect(pubkey.toBase58()).toBe(item.address);
+  }
+  items.forEach((e) =>
+    expect(getDomainKeySync(e.domain).pubkey.toBase58()).toBe(e.address)
+  );
+});
+
+import { test, jest } from "@jest/globals";
+import { Connection, PublicKey, Transaction } from "@solana/web3.js";
+import { createSubdomain } from "../src/bindings";
+import { randomBytes } from "crypto";
+import { VAULT_OWNER } from "../src/constants";
+
+jest.setTimeout(20_000);
+
+const connection = new Connection("https://rpc-public.hellomoon.io");
+
+test("Create sub", async () => {
+  const tx = new Transaction();
+  const [, ix] = await createSubdomain(
+    connection,
+    randomBytes(10).toString("hex") + ".bonfida",
+    new PublicKey("HKKp49qGWXd639QsuH7JiLijfVW5UtCVY4s1n2HANwEA"),
+    2_000
+  );
+  tx.add(...ix);
+  const { blockhash } = await connection.getLatestBlockhash();
+  tx.recentBlockhash = blockhash;
+  tx.feePayer = VAULT_OWNER;
+  const res = await connection.simulateTransaction(tx);
+  expect(res.value.err).toBe(null);
+});
+
+import { test, expect, jest } from "@jest/globals";
+import { getAllDomains } from "../src/utils";
+import { PublicKey, Connection } from "@solana/web3.js";
+
+jest.setTimeout(10_000);
+
+const items = [
+  {
+    user: new PublicKey("Fxuoy3gFjfJALhwkRcuKjRdechcgffUApeYAfMWck6w8"),
+    domain: [
+      "CZFQJkE2uBqdwHH53kBT6UStyfcbCWzh6WHwRRtaLgrm",
+      "ChkcdTKgyVsrLuD9zkUBoUkZ1GdZjTHEmgh5dhnR4haT",
+    ],
+  },
+];
+
+const connection = new Connection("https://rpc-public.hellomoon.io");
+
+test("Get domains", async () => {
+  for (let item of items) {
+    const domains = (await getAllDomains(connection, item.user)).map((e) =>
+      e.toBase58()
+    );
+    domains.sort();
+    expect(domains).toEqual(item.domain);
+  }
+});
+
+import { test, expect, jest } from "@jest/globals";
+import { getAllRegisteredDomains } from "../src/utils";
+import { clusterApiUrl, Connection } from "@solana/web3.js";
+
+jest.setTimeout(4 * 60_000);
+
+const connection = new Connection(clusterApiUrl("mainnet-beta"));
+
+test("All registered", async () => {
+  const registered = await getAllRegisteredDomains(connection);
+  expect(registered.length).toBeGreaterThan(130_000);
+});
+
+import { test, expect, jest } from "@jest/globals";
+import { getFavoriteDomain } from "../src/favorite-domain";
+import { PublicKey, clusterApiUrl, Connection } from "@solana/web3.js";
+
+jest.setTimeout(10_000);
+
+const items = [
+  {
+    user: new PublicKey("FidaeBkZkvDqi1GXNEwB8uWmj9Ngx2HXSS5nyGRuVFcZ"),
+    favorite: {
+      domain: new PublicKey("Crf8hzfthWGbGbLTVCiqRqV5MVnbpHB1L9KQMd6gsinb"),
+      reverse: "bonfida",
+    },
+  },
+];
+
+const connection = new Connection(clusterApiUrl("mainnet-beta"));
+
+test("Favorite domain", async () => {
+  for (let item of items) {
+    const fav = await getFavoriteDomain(connection, item.user);
+
+    expect(fav.domain.toBase58()).toBe(item.favorite.domain.toBase58());
+    expect(fav.reverse).toBe(item.favorite.reverse);
+  }
+});
+
+import { test, jest, expect } from "@jest/globals";
+import { Connection } from "@solana/web3.js";
+import { resolve } from "../src/resolve";
+
+jest.setTimeout(50_000);
+
+const connection = new Connection("https://rpc-public.hellomoon.io");
+
+const LIST = [
+  {
+    domain: "wallet-guide-5.sol",
+    owner: "Fxuoy3gFjfJALhwkRcuKjRdechcgffUApeYAfMWck6w8",
+  },
+  {
+    domain: "wallet-guide-4.sol",
+    owner: "Hf4daCT4tC2Vy9RCe9q8avT68yAsNJ1dQe6xiQqyGuqZ",
+  },
+  {
+    domain: "wallet-guide-3.sol",
+    owner: "Fxuoy3gFjfJALhwkRcuKjRdechcgffUApeYAfMWck6w8",
+  },
+  {
+    domain: "wallet-guide-2.sol",
+    owner: "36Dn3RWhB8x4c83W6ebQ2C2eH9sh5bQX2nMdkP2cWaA4",
+  },
+  {
+    domain: "wallet-guide-1.sol",
+    owner: "36Dn3RWhB8x4c83W6ebQ2C2eH9sh5bQX2nMdkP2cWaA4",
+  },
+  {
+    domain: "wallet-guide-0.sol",
+    owner: "Fxuoy3gFjfJALhwkRcuKjRdechcgffUApeYAfMWck6w8",
+  },
+  {
+    domain: "sub-0.wallet-guide-3.sol",
+    owner: "Fxuoy3gFjfJALhwkRcuKjRdechcgffUApeYAfMWck6w8",
+  },
+  {
+    domain: "sub-1.wallet-guide-3.sol",
+    owner: "Hf4daCT4tC2Vy9RCe9q8avT68yAsNJ1dQe6xiQqyGuqZ",
+  },
+];
+
+test("Resolve domains", async () => {
+  for (let x of LIST) {
+    const owner = await resolve(connection, x.domain);
+    expect(x.owner).toBe(owner.toBase58());
+  }
+});
+
+import { test, jest } from "@jest/globals";
+import { PublicKey, Connection } from "@solana/web3.js";
+import { getTokenizedDomains } from "../src/nft";
+
+jest.setTimeout(10_000);
+const connection = new Connection("https://rpc-public.hellomoon.io");
+
+const items = [
+  {
+    owner: new PublicKey("Fxuoy3gFjfJALhwkRcuKjRdechcgffUApeYAfMWck6w8"),
+    domains: [
+      {
+        key: "uDTBDfKrJSBTgmWUZLcENPk5YrHfWbcrUbNFLjsvNpn",
+        mint: "Eskv5Ns4gyREvNPPgANojNPsz6x1cbn9YwT7esAnxPhP",
+        reverse: "wallet-guide-0",
+      },
+      {
+        key: "iSNVgWfb31aTWa58UxZ6fp7n3TTrUk5Gojggub5stXk",
+        mint: "2RJhBbxTiPT2bZq5bhjaTZbsnhbDB7VtTAMmCdBrwBZP",
+        reverse: "wallet-guide-5",
+      },
+    ],
+  },
+];
+
+test("Get tokenized domains", async () => {
+  const domains = (
+    await getTokenizedDomains(
+      connection,
+      new PublicKey("Fxuoy3gFjfJALhwkRcuKjRdechcgffUApeYAfMWck6w8")
+    )
+  ).map((e) => {
+    return {
+      key: e.key.toBase58(),
+      mint: e.mint.toBase58(),
+      reverse: e.reverse,
+    };
+  });
+  domains.sort();
+  for (let item of items) {
+    item.domains.sort();
+    expect(domains).toEqual(item.domains);
+  }
+});
+
+import { test, jest, expect } from "@jest/globals";
+import * as record from "../src/record";
+import { Connection, PublicKey, Transaction } from "@solana/web3.js";
+import { Record } from "../src/types/record";
+import { createRecordInstruction } from "../src/bindings";
+
+jest.setTimeout(20_000);
+
+const connection = new Connection("https://rpc-public.hellomoon.io");
+
+test("Records", async () => {
+  const domain = "🍍";
+  record.getIpfsRecord(connection, domain).then((e) => {
+    expect(e).toBe("QmbWqxBEKC3P8tqsKc98xmWNzrzDtRLMiMPL8wBuTGsMnR");
+  });
+
+  record
+    .getArweaveRecord(connection, domain)
+    .then((e) => expect(e).toBe("some-arweave-hash"));
+
+  record
+    .getEthRecord(connection, domain)
+    .then((e) => expect(e).toBe("0x570eDC13f9D406a2b4E6477Ddf75D5E9cCF51cd6"));
+
+  record
+    .getBtcRecord(connection, domain)
+    .then((e) => expect(e).toBe("3JfBcjv7TbYN9yQsyfcNeHGLcRjgoHhV3z"));
+
+  record
+    .getLtcRecord(connection, domain)
+    .then((e) => expect(e).toBe("MK6deR3Mi6dUsim9M3GPDG2xfSeSAgSrpQ"));
+
+  record
+    .getDogeRecord(connection, domain)
+    .then((e) => expect(e).toBe("DC79kjg58VfDZeMj9cWNqGuDfYfGJg9DjZ"));
+
+  record
+    .getEmailRecord(connection, domain)
+    .then((e) => expect(e).toBe("🍍@gmail.com"));
+
+  record.getUrlRecord(connection, domain).then((e) => expect(e).toBe("🍍.io"));
+
+  record
+    .getDiscordRecord(connection, domain)
+    .then((e) => expect(e).toBe("@🍍#7493"));
+
+  record
+    .getGithubRecord(connection, domain)
+    .then((e) => expect(expect(e).toBe("@🍍_dev")));
+
+  record
+    .getRedditRecord(connection, domain)
+    .then((e) => expect(e).toBe("@reddit-🍍"));
+
+  record
+    .getTwitterRecord(connection, domain)
+    .then((e) => expect(e).toBe("@🍍"));
+
+  return record
+    .getTelegramRecord(connection, domain)
+    .then((e) => expect(e).toBe("@🍍-tg"));
+});
+
+const sub = "test.🇺🇸.sol";
+
+test("Sub records", async () => {
+  record
+    .getEmailRecord(connection, sub)
+    .then((e) => expect(e).toBe("test@test.com"));
+});
+
+test("Get multiple records", async () => {
+  const records = await record.getRecords(
+    connection,
+    "🍍",
+    [Record.Telegram, Record.Github, Record.Backpack],
+    true
+  );
+  expect(records[0]).toBe("@🍍-tg");
+  expect(records[1]).toBe("@🍍_dev");
+  expect(records[2]).toBe(undefined);
+});
+
+test("BSC", async () => {
+  const res = await record.getBscRecord(connection, "aanda.sol");
+  expect(res).toBe("0x4170ad697176fe6d660763f6e4dfcf25018e8b63");
+});
+
+test("Create", async () => {
+  const domain = "wallet-guide-3.sol";
+  const owner = new PublicKey("Fxuoy3gFjfJALhwkRcuKjRdechcgffUApeYAfMWck6w8");
+  let ix = await createRecordInstruction(
+    connection,
+    domain,
+    Record.A,
+    "192.168.0.1",
+    owner,
+    owner
+  );
+  const tx = new Transaction().add(ix);
+  tx.recentBlockhash = (await connection.getLatestBlockhash()).blockhash;
+  tx.feePayer = owner;
+
+  let res = await connection.simulateTransaction(tx);
+  expect(res.value.err).toBe(null);
+});
+
+import { Connection, PublicKey } from "@solana/web3.js";
+import { deserializeUnchecked, Schema, serialize } from "borsh";
+import { retrieveNftOwner } from "./nft";
+import { Buffer } from "buffer";
+import { ErrorType, SNSError } from "./error";
+
+export class NameRegistryState {
+  static HEADER_LEN = 96;
+  parentName: PublicKey;
+  owner: PublicKey;
+  class: PublicKey;
+  data: Buffer | undefined;
+
+  static schema: Schema = new Map([
+    [
+      NameRegistryState,
+      {
+        kind: "struct",
+        fields: [
+          ["parentName", [32]],
+          ["owner", [32]],
+          ["class", [32]],
+        ],
+      },
+    ],
+  ]);
+  constructor(obj: {
+    parentName: Uint8Array;
+    owner: Uint8Array;
+    class: Uint8Array;
+  }) {
+    this.parentName = new PublicKey(obj.parentName);
+    this.owner = new PublicKey(obj.owner);
+    this.class = new PublicKey(obj.class);
+  }
+
+  public static async retrieve(
+    connection: Connection,
+    nameAccountKey: PublicKey
+  ) {
+    const nameAccount = await connection.getAccountInfo(nameAccountKey);
+    if (!nameAccount) {
+      throw new SNSError(ErrorType.AccountDoesNotExist);
+    }
+
+    let res: NameRegistryState = deserializeUnchecked(
+      this.schema,
+      NameRegistryState,
+      nameAccount.data
+    );
+
+    res.data = nameAccount.data?.slice(this.HEADER_LEN);
+
+    const nftOwner = await retrieveNftOwner(connection, nameAccountKey);
+
+    return { registry: res, nftOwner };
+  }
+
+  static async _retrieveBatch(
+    connection: Connection,
+    nameAccountKeys: PublicKey[]
+  ) {
+    const nameAccounts = await connection.getMultipleAccountsInfo(
+      nameAccountKeys
+    );
+    const fn = (data: Buffer | undefined) => {
+      if (!data) return undefined;
+      const res: NameRegistryState = deserializeUnchecked(
+        this.schema,
+        NameRegistryState,
+        data
+      );
+      res.data = data?.slice(this.HEADER_LEN);
+      return res;
+    };
+    return nameAccounts.map((e) => fn(e?.data));
+  }
+
+  public static async retrieveBatch(
+    connection: Connection,
+    nameAccountKeys: PublicKey[]
+  ) {
+    let result: (NameRegistryState | undefined)[] = [];
+    const keys = [...nameAccountKeys];
+    while (keys.length > 0) {
+      result.push(
+        ...(await this._retrieveBatch(connection, keys.splice(0, 100)))
+      );
+    }
+    return result;
+  }
+}
+
+export class TokenData {
+  name: string;
+  ticker: string;
+  mint: Uint8Array;
+  decimals: number;
+  website?: string;
+  logoUri?: string;
+
+  constructor(obj: {
+    name: string;
+    ticker: string;
+    mint: Uint8Array;
+    decimals: number;
+    website?: string;
+    logoUri?: string;
+  }) {
+    this.name = obj.name;
+    this.ticker = obj.ticker;
+    this.mint = obj.mint;
+    this.decimals = obj.decimals;
+    this.website = obj?.website;
+    this.logoUri = obj?.logoUri;
+  }
+
+  static schema: Schema = new Map([
+    [
+      TokenData,
+      {
+        kind: "struct",
+        fields: [
+          ["name", "string"],
+          ["ticker", "string"],
+          ["mint", [32]],
+          ["decimals", "u8"],
+          ["website", { kind: "option", type: "string" }],
+          ["logoUri", { kind: "option", type: "string" }],
+        ],
+      },
+    ],
+  ]);
+
+  serialize(): Uint8Array {
+    return serialize(TokenData.schema, this);
+  }
+  static deserialize(data: Buffer) {
+    return deserializeUnchecked(TokenData.schema, TokenData, data) as TokenData;
+  }
+}
+
+export class Mint {
+  mint: Uint8Array;
+  constructor(obj: { mint: Uint8Array }) {
+    this.mint = obj.mint;
+  }
+
+  static schema: Schema = new Map([
+    [
+      Mint,
+      {
+        kind: "struct",
+        fields: [["mint", [32]]],
+      },
+    ],
+  ]);
+
+  serialize(): Uint8Array {
+    return serialize(Mint.schema, this);
+  }
+  static deserialize(data: Buffer) {
+    return deserializeUnchecked(Mint.schema, Mint, data) as Mint;
+  }
+}
+
+import { Buffer } from "buffer";
+import BN from "bn.js";
+import { ErrorType, SNSError } from "./error";
+
+export class Numberu32 extends BN {
+  /**
+   * Convert to Buffer representation
+   */
+  toBuffer(): Buffer {
+    const a = super.toArray().reverse();
+    const b = Buffer.from(a);
+    if (b.length === 4) {
+      return b;
+    }
+    if (b.length > 4) {
+      throw new SNSError(ErrorType.U32Overflow);
+    }
+
+    const zeroPad = Buffer.alloc(4);
+    b.copy(zeroPad);
+    return zeroPad;
+  }
+
+  /**
+   * Construct a Numberu64 from Buffer representation
+   */
+  static fromBuffer(buffer): BN {
+    if (buffer.length !== 4) {
+      throw new SNSError(
+        ErrorType.InvalidBufferLength,
+        `Invalid buffer length: ${buffer.length}`
+      );
+    }
+
+    return new BN(
+      [...buffer]
+        .reverse()
+        .map((i) => `00${i.toString(16)}`.slice(-2))
+        .join(""),
+      16
+    );
+  }
+}
+
+export class Numberu64 extends BN {
+  /**
+   * Convert to Buffer representation
+   */
+  toBuffer(): Buffer {
+    const a = super.toArray().reverse();
+    const b = Buffer.from(a);
+    if (b.length === 8) {
+      return b;
+    }
+
+    if (b.length > 8) {
+      throw new SNSError(ErrorType.U64Overflow);
+    }
+
+    const zeroPad = Buffer.alloc(8);
+    b.copy(zeroPad);
+    return zeroPad;
+  }
+
+  /**
+   * Construct a Numberu64 from Buffer representation
+   */
+  static fromBuffer(buffer): BN {
+    if (buffer.length !== 8) {
+      throw new SNSError(
+        ErrorType.U64Overflow,
+        `Invalid buffer length: ${buffer.length}`
+      );
+    }
+    return new BN(
+      [...buffer]
+        .reverse()
+        .map((i) => `00${i.toString(16)}`.slice(-2))
+        .join(""),
+      16
+    );
+  }
+}
+
+import { Buffer } from "buffer";
+import { deserialize, Schema } from "borsh";
+import { reverseLookup } from "./utils";
+import { PublicKey, Connection } from "@solana/web3.js";
+import { ErrorType, SNSError } from "./error";
+
+export const NAME_OFFERS_ID = new PublicKey(
+  "85iDfUvr3HJyLM2zcq5BXSiDvUWfw6cSE1FfNBo8Ap29"
+);
+
+export class FavouriteDomain {
+  tag: number;
+  nameAccount: PublicKey;
+
+  static schema: Schema = new Map([
+    [
+      FavouriteDomain,
+      {
+        kind: "struct",
+        fields: [
+          ["tag", "u8"],
+          ["nameAccount", [32]],
+        ],
+      },
+    ],
+  ]);
+
+  constructor(obj: { tag: number; nameAccount: Uint8Array }) {
+    this.tag = obj.tag;
+    this.nameAccount = new PublicKey(obj.nameAccount);
+  }
+
+  /**
+   * This function can be used to deserialize a Buffer into a FavouriteDomain object
+   * @param data The buffer to deserialize
+   * @returns
+   */
+  static deserialize(data: Buffer) {
+    return deserialize(this.schema, FavouriteDomain, data);
+  }
+
+  /**
+   * This function can be used to retrieve and deserialize a favorite domain
+   * @param connection The Solana RPC connection object
+   * @param key The favorite account key
+   * @returns
+   */
+  static async retrieve(connection: Connection, key: PublicKey) {
+    const accountInfo = await connection.getAccountInfo(key);
+    if (!accountInfo || !accountInfo.data) {
+      throw new SNSError(ErrorType.FavouriteDomainNotFound);
+    }
+    return this.deserialize(accountInfo.data);
+  }
+
+  /**
+   * This function can be used to derive the key of a favorite domain
+   * @param programId The name offer program ID
+   * @param owner The owner to retrieve the favorite domain for
+   * @returns
+   */
+  static async getKey(programId: PublicKey, owner: PublicKey) {
+    return await PublicKey.findProgramAddress(
+      [Buffer.from("favourite_domain"), owner.toBuffer()],
+      programId
+    );
+  }
+
+  /**
+   * This function can be used to derive the key of a favorite domain
+   * @param programId The name offer program ID
+   * @param owner The owner to retrieve the favorite domain for
+   * @returns
+   */
+  static getKeySync(programId: PublicKey, owner: PublicKey) {
+    return PublicKey.findProgramAddressSync(
+      [Buffer.from("favourite_domain"), owner.toBuffer()],
+      programId
+    );
+  }
+}
+
+/**
+ * This function can be used to retrieve the favorite domain of a user
+ * @param connection The Solana RPC connection object
+ * @param owner The owner you want to retrieve the favorite domain for
+ * @returns
+ */
+export const getFavoriteDomain = async (
+  connection: Connection,
+  owner: PublicKey
+) => {
+  const [favKey] = FavouriteDomain.getKeySync(
+    NAME_OFFERS_ID,
+    new PublicKey(owner)
+  );
+
+  const favorite = await FavouriteDomain.retrieve(connection, favKey);
+
+  const reverse = await reverseLookup(connection, favorite.nameAccount);
+
+  return { domain: favorite.nameAccount, reverse };
+};
+
+import { RECORD_V1_SIZE, Record } from "./types/record";
+import { Connection, PublicKey } from "@solana/web3.js";
+import { getDomainKeySync } from "./utils";
+import { NameRegistryState } from "./state";
+import { Buffer } from "buffer";
+import { decode, encode } from "bech32-buffer";
+import { checkSolRecord } from "./resolve";
+import base58 from "bs58";
+import ipaddr from "ipaddr.js";
+import { encode as encodePunycode } from "punycode";
+import { check } from "./utils";
+import { ErrorType, SNSError } from "./error";
+
+const trimNullPaddingIdx = (buffer: Buffer): number => {
+  const arr = Array.from(buffer);
+  const lastNonNull =
+    arr.length - 1 - arr.reverse().findIndex((byte) => byte !== 0);
+  return lastNonNull + 1;
+};
+
+/**
+ * This function can be used to derive a record key
+ * @param domain The .sol domain name
+ * @param record The record to derive the key for
+ * @returns
+ */
+export const getRecordKeySync = (domain: string, record: Record) => {
+  const { pubkey } = getDomainKeySync(record + "." + domain, true);
+  return pubkey;
+};
+
+// Overload signature for the case where deserialize is true.
+export async function getRecord(
+  connection: Connection,
+  domain: string,
+  record: Record,
+  deserialize: true
+): Promise<string | undefined>;
+
+// Overload signature for the case where deserialize is false or undefined.
+export async function getRecord(
+  connection: Connection,
+  domain: string,
+  record: Record,
+  deserialize?: false
+): Promise<NameRegistryState | undefined>;
+
+/**
+ * This function can be used to retrieve a specified record for the given domain name
+ * @param connection The Solana RPC connection object
+ * @param domain The .sol domain name
+ * @param record The record to search for
+ * @returns
+ */
+export async function getRecord(
+  connection: Connection,
+  domain: string,
+  record: Record,
+  deserialize?: boolean
+) {
+  const pubkey = getRecordKeySync(domain, record);
+  let { registry } = await NameRegistryState.retrieve(connection, pubkey);
+
+  if (!registry.data) {
+    throw new SNSError(ErrorType.NoRecordData);
+  }
+
+  if (deserialize) {
+    return deserializeRecord(registry, record, pubkey);
+  }
+  const recordSize = RECORD_V1_SIZE.get(record);
+  registry.data = registry.data.slice(0, recordSize);
+
+  return registry;
+}
+
+// Overload signature for the case where deserialize is true.
+export async function getRecords(
+  connection: Connection,
+  domain: string,
+  records: Record[],
+  deserialize: true
+): Promise<string[]>;
+
+// Overload signature for the case where deserialize is false or undefined.
+export async function getRecords(
+  connection: Connection,
+  domain: string,
+  records: Record[],
+  deserialize?: false
+): Promise<NameRegistryState[]>;
+
+export async function getRecords(
+  connection: Connection,
+  domain: string,
+  records: Record[],
+  deserialize?: boolean
+) {
+  const pubkeys = records.map((record) => getRecordKeySync(domain, record));
+  const registries = await NameRegistryState.retrieveBatch(connection, pubkeys);
+
+  if (deserialize) {
+    return registries.map((e, idx) => {
+      if (!e) return undefined;
+      return deserializeRecord(
+        e,
+        records[idx],
+        getRecordKeySync(domain, records[idx])
+      );
+    });
+  }
+  return registries;
+}
+
+/**
+ * This function can be used to retrieve the IPFS record of a domain name
+ * @param connection The Solana RPC connection object
+ * @param domain The .sol domain name
+ * @returns
+ */
+export const getIpfsRecord = async (connection: Connection, domain: string) => {
+  return await getRecord(connection, domain, Record.IPFS, true);
+};
+
+/**
+ * This function can be used to retrieve the Arweave record of a domain name
+ * @param connection The Solana RPC connection object
+ * @param domain The .sol domain name
+ * @returns
+ */
+export const getArweaveRecord = async (
+  connection: Connection,
+  domain: string
+) => {
+  return await getRecord(connection, domain, Record.ARWV, true);
+};
+
+/**
+ * This function can be used to retrieve the ETH record of a domain name
+ * @param connection The Solana RPC connection object
+ * @param domain The .sol domain name
+ * @returns
+ */
+export const getEthRecord = async (connection: Connection, domain: string) => {
+  return await getRecord(connection, domain, Record.ETH, true);
+};
+
+/**
+ * This function can be used to retrieve the BTC record of a domain name
+ * @param connection The Solana RPC connection object
+ * @param domain The .sol domain name
+ * @returns
+ */
+export const getBtcRecord = async (connection: Connection, domain: string) => {
+  return await getRecord(connection, domain, Record.BTC, true);
+};
+
+/**
+ * This function can be used to retrieve the LTC record of a domain name
+ * @param connection The Solana RPC connection object
+ * @param domain The .sol domain name
+ * @returns
+ */
+export const getLtcRecord = async (connection: Connection, domain: string) => {
+  return await getRecord(connection, domain, Record.LTC, true);
+};
+
+/**
+ * This function can be used to retrieve the DOGE record of a domain name
+ * @param connection The Solana RPC connection object
+ * @param domain The .sol domain name
+ * @returns
+ */
+export const getDogeRecord = async (connection: Connection, domain: string) => {
+  return await getRecord(connection, domain, Record.DOGE, true);
+};
+
+/**
+ * This function can be used to retrieve the email record of a domain name
+ * @param connection The Solana RPC connection object
+ * @param domain The .sol domain name
+ * @returns
+ */
+export const getEmailRecord = async (
+  connection: Connection,
+  domain: string
+) => {
+  return await getRecord(connection, domain, Record.Email, true);
+};
+
+/**
+ * This function can be used to retrieve the URL record of a domain name
+ * @param connection The Solana RPC connection object
+ * @param domain The .sol domain name
+ * @returns
+ */
+export const getUrlRecord = async (connection: Connection, domain: string) => {
+  return await getRecord(connection, domain, Record.Url, true);
+};
+
+/**
+ * This function can be used to retrieve the Discord record of a domain name
+ * @param connection The Solana RPC connection object
+ * @param domain The .sol domain name
+ * @returns
+ */
+export const getDiscordRecord = async (
+  connection: Connection,
+  domain: string
+) => {
+  return await getRecord(connection, domain, Record.Discord, true);
+};
+
+/**
+ * This function can be used to retrieve the Github record of a domain name
+ * @param connection The Solana RPC connection object
+ * @param domain The .sol domain name
+ * @returns
+ */
+export const getGithubRecord = async (
+  connection: Connection,
+  domain: string
+) => {
+  return await getRecord(connection, domain, Record.Github, true);
+};
+
+/**
+ * This function can be used to retrieve the Reddit record of a domain name
+ * @param connection The Solana RPC connection object
+ * @param domain The .sol domain name
+ * @returns
+ */
+export const getRedditRecord = async (
+  connection: Connection,
+  domain: string
+) => {
+  return await getRecord(connection, domain, Record.Reddit, true);
+};
+
+/**
+ * This function can be used to retrieve the Twitter record of a domain name
+ * @param connection The Solana RPC connection object
+ * @param domain The .sol domain name
+ * @returns
+ */
+export const getTwitterRecord = async (
+  connection: Connection,
+  domain: string
+) => {
+  return await getRecord(connection, domain, Record.Twitter, true);
+};
+
+/**
+ * This function can be used to retrieve the Telegram record of a domain name
+ * @param connection The Solana RPC connection object
+ * @param domain The .sol domain name
+ * @returns
+ */
+export const getTelegramRecord = async (
+  connection: Connection,
+  domain: string
+) => {
+  return await getRecord(connection, domain, Record.Telegram, true);
+};
+
+/**
+ * This function can be used to retrieve the pic record of a domain name
+ * @param connection The Solana RPC connection object
+ * @param domain The .sol domain name
+ * @returns
+ */
+export const getPicRecord = async (connection: Connection, domain: string) => {
+  return await getRecord(connection, domain, Record.Pic, true);
+};
+
+/**
+ * This function can be used to retrieve the SHDW record of a domain name
+ * @param connection The Solana RPC connection object
+ * @param domain The .sol domain name
+ * @returns
+ */
+export const getShdwRecord = async (connection: Connection, domain: string) => {
+  return await getRecord(connection, domain, Record.SHDW, true);
+};
+
+/**
+ * This function can be used to retrieve the SOL record of a domain name
+ * @param connection The Solana RPC connection object
+ * @param domain The .sol domain name
+ * @returns
+ */
+export const getSolRecord = async (connection: Connection, domain: string) => {
+  return await getRecord(connection, domain, Record.SOL);
+};
+
+/**
+ * This function can be used to retrieve the POINT record of a domain name
+ * @param connection The Solana RPC connection object
+ * @param domain The .sol domain name
+ * @returns
+ */
+export const getPointRecord = async (
+  connection: Connection,
+  domain: string
+) => {
+  return await getRecord(connection, domain, Record.POINT, true);
+};
+
+/**
+ * This function can be used to retrieve the BSC record of a domain name
+ * @param connection The Solana RPC connection object
+ * @param domain The .sol domain name
+ * @returns
+ */
+export const getBscRecord = async (connection: Connection, domain: string) => {
+  return await getRecord(connection, domain, Record.BSC, true);
+};
+
+/**
+ * This function can be used to retrieve the Injective record of a domain name
+ * @param connection The Solana RPC connection object
+ * @param domain The .sol domain name
+ * @returns
+ */
+export const getInjectiveRecord = async (
+  connection: Connection,
+  domain: string
+) => {
+  return await getRecord(connection, domain, Record.Injective, true);
+};
+
+/**
+ * This function can be used to retrieve the Backpack record of a domain name
+ * @param connection The Solana RPC connection object
+ * @param domain The .sol domain name
+ * @returns
+ */
+export const getBackpackRecord = async (
+  connection: Connection,
+  domain: string
+) => {
+  return await getRecord(connection, domain, Record.Backpack, true);
+};
+
+/**
+ * This function can be used to deserialize the content of a record. If the content is invalid it will throw an error
+ * @param registry The name registry state object of the record being deserialized
+ * @param record The record enum being deserialized
+ * @param recordKey The public key of the record being deserialized
+ * @returns
+ */
+export const deserializeRecord = (
+  registry: NameRegistryState | undefined,
+  record: Record,
+  recordKey: PublicKey
+): string | undefined => {
+  const buffer = registry?.data;
+  if (!buffer) return undefined;
+
+  const size = RECORD_V1_SIZE.get(record);
+  const idx = trimNullPaddingIdx(buffer);
+
+  if (!size) {
+    return buffer.slice(0, idx).toString("utf-8");
+  }
+
+  // Old record UTF-8 encoded
+  if (size && idx !== size) {
+    const address = buffer.slice(0, idx).toString("utf-8");
+    if (record === Record.Injective) {
+      const decoded = decode(address);
+      if (decoded.prefix === "inj" && decoded.data.length === 20) {
+        return address;
+      }
+    } else if (record === Record.BSC || record === Record.ETH) {
+      const prefix = address.slice(0, 2);
+      const hex = address.slice(2);
+      if (prefix === "0x" && Buffer.from(hex, "hex").length === 20) {
+        return address;
+      }
+    } else if (record === Record.A || record === Record.AAAA) {
+      if (ipaddr.isValid(address)) {
+        return address;
+      }
+    }
+    throw new SNSError(ErrorType.InvalidRecordData);
+  }
+
+  if (record === Record.SOL) {
+    const encoder = new TextEncoder();
+    const expectedBuffer = Buffer.concat([
+      buffer.slice(0, 32),
+      recordKey.toBuffer(),
+    ]);
+    const expected = encoder.encode(expectedBuffer.toString("hex"));
+    const valid = checkSolRecord(expected, buffer.slice(32), registry.owner);
+    if (valid) {
+      return base58.encode(buffer.slice(0, 32));
+    }
+  } else if (record === Record.ETH || record === Record.BSC) {
+    return "0x" + buffer.slice(0, size).toString("hex");
+  } else if (record === Record.Injective) {
+    return encode("inj", buffer.slice(0, size), "bech32");
+  } else if (record === Record.A || record === Record.AAAA) {
+    return ipaddr.fromByteArray([...buffer.slice(0, size)]).toString();
+  }
+  throw new SNSError(ErrorType.InvalidRecordData);
+};
+
+/**
+ * This function can be used to serialize a user input string into a buffer that will be stored into a record account data
+ * For serializing SOL records use `serializeSolRecord`
+ * @param str The string being serialized into the record account data
+ * @param record The record enum being serialized
+ * @returns
+ */
+export const serializeRecord = (str: string, record: Record): Buffer => {
+  const size = RECORD_V1_SIZE.get(record);
+
+  if (!size) {
+    if (record === Record.CNAME || record === Record.TXT) {
+      str = encodePunycode(str);
+    }
+    return Buffer.from(str, "utf-8");
+  }
+
+  if (record === Record.SOL) {
+    throw new SNSError(
+      ErrorType.UnsupportedRecord,
+      "Use `serializeSolRecord` for SOL record"
+    );
+  } else if (record === Record.ETH || record === Record.BSC) {
+    check(str.slice(0, 2) === "0x", ErrorType.InvalidEvmAddress);
+    return Buffer.from(str.slice(2), "hex");
+  } else if (record === Record.Injective) {
+    const decoded = decode(str);
+    check(decoded.prefix === "inj", ErrorType.InvalidInjectiveAddress);
+    check(decoded.data.length === 20, ErrorType.InvalidInjectiveAddress);
+    return Buffer.from(decoded.data);
+  } else if (record === Record.A) {
+    const array = ipaddr.parse(str).toByteArray();
+    check(array.length === 4, ErrorType.InvalidARecord);
+    return Buffer.from(array);
+  } else if (record === Record.AAAA) {
+    const array = ipaddr.parse(str).toByteArray();
+    check(array.length === 16, ErrorType.InvalidAAAARecord);
+    return Buffer.from(array);
+  }
+
+  throw new SNSError(ErrorType.InvalidRecordInput);
+};
+
+/**
+ * This function can be used to build the content of a SOL record
+ * @param content The public key being stored in the SOL record
+ * @param recordKey The record public key
+ * @param signer The signer of the record i.e the domain owner
+ * @param signature The signature of the record's content
+ * @returns
+ */
+export const serializeSolRecord = (
+  content: PublicKey,
+  recordKey: PublicKey,
+  signer: PublicKey,
+  signature: Uint8Array
+): Buffer => {
+  const expected = Buffer.concat([content.toBuffer(), recordKey.toBuffer()]);
+  const encodedMessage = new TextEncoder().encode(expected.toString("hex"));
+  const valid = checkSolRecord(encodedMessage, signature, signer);
+  check(valid, ErrorType.InvalidSignature);
+
+  return Buffer.concat([content.toBuffer(), signature]);
+};
+
+import { Buffer } from "buffer";
+import {
+  Connection,
+  PublicKey,
+  SystemProgram,
+  TransactionInstruction,
+  SYSVAR_RENT_PUBKEY,
+} from "@solana/web3.js";
+import {
+  createInstruction,
+  deleteInstruction,
+  transferInstruction,
+  updateInstruction,
+  createReverseInstruction,
+  createInstructionV3,
+} from "./instructions";
+import { NameRegistryState } from "./state";
+import { Numberu64, Numberu32 } from "./int";
+import {
+  getHashedName,
+  getNameAccountKey,
+  getNameOwner,
+} from "./deprecated/utils";
+import {
+  NAME_PROGRAM_ID,
+  ROOT_DOMAIN_ACCOUNT,
+  REGISTER_PROGRAM_ID,
+  REFERRERS,
+  USDC_MINT,
+  TOKENS_SYM_MINT,
+  PYTH_MAPPING_ACC,
+  VAULT_OWNER,
+} from "./constants";
+import {
+  getPythProgramKeyForCluster,
+  PythHttpClient,
+} from "@pythnetwork/client";
+import {
+  check,
+  getDomainKeySync,
+  getHashedNameSync,
+  getNameAccountKeySync,
+  getReverseKeySync,
+} from "./utils";
+import {
+  TOKEN_PROGRAM_ID,
+  getAssociatedTokenAddressSync,
+  createAssociatedTokenAccountInstruction,
+} from "@solana/spl-token";
+import { ErrorType, SNSError } from "./error";
+import { serializeRecord, serializeSolRecord } from "./record";
+import { Record } from "./types/record";
+
+/**
+ * Creates a name account with the given rent budget, allocated space, owner and class.
+ *
+ * @param connection The solana connection object to the RPC node
+ * @param name The name of the new account
+ * @param space The space in bytes allocated to the account
+ * @param payerKey The allocation cost payer
+ * @param nameOwner The pubkey to be set as owner of the new name account
+ * @param lamports The budget to be set for the name account. If not specified, it'll be the minimum for rent exemption
+ * @param nameClass The class of this new name
+ * @param parentName The parent name of the new name. If specified its owner needs to sign
+ * @returns
+ */
+export async function createNameRegistry(
+  connection: Connection,
+  name: string,
+  space: number,
+  payerKey: PublicKey,
+  nameOwner: PublicKey,
+  lamports?: number,
+  nameClass?: PublicKey,
+  parentName?: PublicKey
+): Promise<TransactionInstruction> {
+  const hashed_name = await getHashedName(name);
+  const nameAccountKey = await getNameAccountKey(
+    hashed_name,
+    nameClass,
+    parentName
+  );
+
+  const balance = lamports
+    ? lamports
+    : await connection.getMinimumBalanceForRentExemption(space);
+
+  let nameParentOwner: PublicKey | undefined;
+  if (parentName) {
+    const { registry: parentAccount } = await getNameOwner(
+      connection,
+      parentName
+    );
+    nameParentOwner = parentAccount.owner;
+  }
+
+  const createNameInstr = createInstruction(
+    NAME_PROGRAM_ID,
+    SystemProgram.programId,
+    nameAccountKey,
+    nameOwner,
+    payerKey,
+    hashed_name,
+    //@ts-ignore
+    new Numberu64(balance),
+    //@ts-ignore
+    new Numberu32(space),
+    nameClass,
+    parentName,
+    nameParentOwner
+  );
+
+  return createNameInstr;
+}
+
+/**
+ * Overwrite the data of the given name registry.
+ *
+ * @param connection The solana connection object to the RPC node
+ * @param name The name of the name registry to update
+ * @param offset The offset to which the data should be written into the registry
+ * @param input_data The data to be written
+ * @param nameClass The class of this name, if it exsists
+ * @param nameParent The parent name of this name, if it exists
+ */
+export async function updateNameRegistryData(
+  connection: Connection,
+  name: string,
+  offset: number,
+  input_data: Buffer,
+  nameClass?: PublicKey,
+  nameParent?: PublicKey
+): Promise<TransactionInstruction> {
+  const hashed_name = await getHashedName(name);
+  const nameAccountKey = await getNameAccountKey(
+    hashed_name,
+    nameClass,
+    nameParent
+  );
+
+  let signer: PublicKey;
+  if (nameClass) {
+    signer = nameClass;
+  } else {
+    signer = (await NameRegistryState.retrieve(connection, nameAccountKey))
+      .registry.owner;
+  }
+
+  const updateInstr = updateInstruction(
+    NAME_PROGRAM_ID,
+    nameAccountKey,
+    //@ts-ignore
+    new Numberu32(offset),
+    input_data,
+    signer
+  );
+
+  return updateInstr;
+}
+
+/**
+ * Change the owner of a given name account.
+ *
+ * @param connection The solana connection object to the RPC node
+ * @param name The name of the name account
+ * @param newOwner The new owner to be set
+ * @param nameClass The class of this name, if it exsists
+ * @param nameParent The parent name of this name, if it exists
+ * @param parentOwner Parent name owner
+ * @returns
+ */
+export async function transferNameOwnership(
+  connection: Connection,
+  name: string,
+  newOwner: PublicKey,
+  nameClass?: PublicKey,
+  nameParent?: PublicKey,
+  parentOwner?: PublicKey
+): Promise<TransactionInstruction> {
+  const hashed_name = await getHashedName(name);
+  const nameAccountKey = await getNameAccountKey(
+    hashed_name,
+    nameClass,
+    nameParent
+  );
+
+  let curentNameOwner: PublicKey;
+  if (nameClass) {
+    curentNameOwner = nameClass;
+  } else {
+    curentNameOwner = (
+      await NameRegistryState.retrieve(connection, nameAccountKey)
+    ).registry.owner;
+  }
+
+  const transferInstr = transferInstruction(
+    NAME_PROGRAM_ID,
+    nameAccountKey,
+    newOwner,
+    curentNameOwner,
+    nameClass,
+    nameParent,
+    parentOwner
+  );
+
+  return transferInstr;
+}
+
+/**
+ * Delete the name account and transfer the rent to the target.
+ *
+ * @param connection The solana connection object to the RPC node
+ * @param name The name of the name account
+ * @param refundTargetKey The refund destination address
+ * @param nameClass The class of this name, if it exsists
+ * @param nameParent The parent name of this name, if it exists
+ * @returns
+ */
+export async function deleteNameRegistry(
+  connection: Connection,
+  name: string,
+  refundTargetKey: PublicKey,
+  nameClass?: PublicKey,
+  nameParent?: PublicKey
+): Promise<TransactionInstruction> {
+  const hashed_name = await getHashedName(name);
+  const nameAccountKey = await getNameAccountKey(
+    hashed_name,
+    nameClass,
+    nameParent
+  );
+
+  let nameOwner: PublicKey;
+  if (nameClass) {
+    nameOwner = nameClass;
+  } else {
+    nameOwner = (await NameRegistryState.retrieve(connection, nameAccountKey))
+      .registry.owner;
+  }
+
+  const changeAuthoritiesInstr = deleteInstruction(
+    NAME_PROGRAM_ID,
+    nameAccountKey,
+    refundTargetKey,
+    nameOwner
+  );
+
+  return changeAuthoritiesInstr;
+}
+
+/**
+ * This function can be used to register a .sol domain
+ * @param connection The Solana RPC connection object
+ * @param name The domain name to register e.g bonfida if you want to register bonfida.sol
+ * @param space The domain name account size (max 10kB)
+ * @param buyer The public key of the buyer
+ * @param buyerTokenAccount The buyer token account (USDC)
+ * @param mint Optional mint used to purchase the domain, defaults to USDC
+ * @param referrerKey Optional referrer key
+ * @returns
+ */
+export const registerDomainName = async (
+  connection: Connection,
+  name: string,
+  space: number,
+  buyer: PublicKey,
+  buyerTokenAccount: PublicKey,
+  mint = USDC_MINT,
+  referrerKey?: PublicKey
+) => {
+  const [cs] = PublicKey.findProgramAddressSync(
+    [REGISTER_PROGRAM_ID.toBuffer()],
+    REGISTER_PROGRAM_ID
+  );
+
+  const hashed = getHashedNameSync(name);
+  const nameAccount = getNameAccountKeySync(
+    hashed,
+    undefined,
+    ROOT_DOMAIN_ACCOUNT
+  );
+
+  const hashedReverseLookup = getHashedNameSync(nameAccount.toBase58());
+  const reverseLookupAccount = getNameAccountKeySync(hashedReverseLookup, cs);
+
+  const [derived_state] = PublicKey.findProgramAddressSync(
+    [nameAccount.toBuffer()],
+    REGISTER_PROGRAM_ID
+  );
+
+  const refIdx = REFERRERS.findIndex((e) => referrerKey?.equals(e));
+  let refTokenAccount: PublicKey | undefined = undefined;
+
+  const ixs: TransactionInstruction[] = [];
+
+  if (refIdx !== -1 && !!referrerKey) {
+    refTokenAccount = getAssociatedTokenAddressSync(mint, referrerKey, true);
+    const acc = await connection.getAccountInfo(refTokenAccount);
+    if (!acc?.data) {
+      const ix = createAssociatedTokenAccountInstruction(
+        buyer,
+        refTokenAccount,
+        referrerKey,
+        mint
+      );
+      ixs.push(ix);
+    }
+  }
+
+  const pythConnection = new PythHttpClient(
+    connection,
+    getPythProgramKeyForCluster("mainnet-beta")
+  );
+  const data = await pythConnection.getData();
+
+  const symbol = TOKENS_SYM_MINT.get(mint.toBase58());
+
+  if (!symbol) {
+    throw new SNSError(
+      ErrorType.SymbolNotFound,
+      `No symbol found for mint ${mint.toBase58()}`
+    );
+  }
+
+  const priceData = data.productPrice.get("Crypto." + symbol + "/USD")!;
+  const productData = data.productFromSymbol.get("Crypto." + symbol + "/USD")!;
+
+  const vault = getAssociatedTokenAddressSync(mint, VAULT_OWNER);
+
+  const ix = new createInstructionV3({
+    name,
+    space,
+    referrerIdxOpt: refIdx != -1 ? refIdx : null,
+  }).getInstruction(
+    REGISTER_PROGRAM_ID,
+    NAME_PROGRAM_ID,
+    ROOT_DOMAIN_ACCOUNT,
+    nameAccount,
+    reverseLookupAccount,
+    SystemProgram.programId,
+    cs,
+    buyer,
+    buyerTokenAccount,
+    PYTH_MAPPING_ACC,
+    priceData.productAccountKey,
+    new PublicKey(productData.price_account),
+    vault,
+    TOKEN_PROGRAM_ID,
+    SYSVAR_RENT_PUBKEY,
+    derived_state,
+    refTokenAccount
+  );
+  ixs.push(ix);
+
+  return [[], ixs];
+};
+
+/**
+ *
+ * @param nameAccount The name account to create the reverse account for
+ * @param name The name of the domain
+ * @param feePayer The fee payer of the transaction
+ * @param parentName The parent name account
+ * @param parentNameOwner The parent name owner
+ * @returns
+ */
+export const createReverseName = async (
+  nameAccount: PublicKey,
+  name: string,
+  feePayer: PublicKey,
+  parentName?: PublicKey,
+  parentNameOwner?: PublicKey
+) => {
+  let [centralState] = await PublicKey.findProgramAddress(
+    [REGISTER_PROGRAM_ID.toBuffer()],
+    REGISTER_PROGRAM_ID
+  );
+
+  let hashedReverseLookup = await getHashedName(nameAccount.toBase58());
+  let reverseLookupAccount = await getNameAccountKey(
+    hashedReverseLookup,
+    centralState,
+    parentName
+  );
+
+  let initCentralStateInstruction = new createReverseInstruction({
+    name,
+  }).getInstruction(
+    REGISTER_PROGRAM_ID,
+    SYSVAR_RENT_PUBKEY,
+    NAME_PROGRAM_ID,
+    ROOT_DOMAIN_ACCOUNT,
+    reverseLookupAccount,
+    centralState,
+    feePayer,
+    parentName,
+    parentNameOwner
+  );
+
+  let instructions = [initCentralStateInstruction];
+
+  return [[], instructions];
+};
+
+/**
+ * This function can be used to create a subdomain
+ * @param connection The Solana RPC connection object
+ * @param subdomain The subdomain to create with or without .sol e.g something.bonfida.sol or something.bonfida
+ * @param owner The owner of the parent domain creating the subdomain
+ * @param space The space to allocate to the subdomain (defaults to 2kb)
+ */
+export const createSubdomain = async (
+  connection: Connection,
+  subdomain: string,
+  owner: PublicKey,
+  space = 2_000
+) => {
+  const ixs: TransactionInstruction[] = [];
+  const sub = subdomain.split(".")[0];
+  if (!sub) {
+    throw new SNSError(ErrorType.InvalidSubdomain);
+  }
+
+  const { parent, pubkey } = getDomainKeySync(subdomain);
+
+  // Space allocated to the subdomains
+  const lamports = await connection.getMinimumBalanceForRentExemption(
+    space + NameRegistryState.HEADER_LEN
+  );
+
+  const ix_create = await createNameRegistry(
+    connection,
+    "\0".concat(sub),
+    space, // Hardcode space to 2kB
+    owner,
+    owner,
+    lamports,
+    undefined,
+    parent
+  );
+  ixs.push(ix_create);
+
+  // Create the reverse name
+  const reverseKey = getReverseKeySync(subdomain, true);
+  const info = await connection.getAccountInfo(reverseKey);
+  if (!info?.data) {
+    const [, ix_reverse] = await createReverseName(
+      pubkey,
+      "\0".concat(sub),
+      owner,
+      parent,
+      owner
+    );
+    ixs.push(...ix_reverse);
+  }
+
+  return [[], ixs];
+};
+
+/**
+ * This function can be used be create a record, it handles the serialization of the record data
+ * To create a SOL record use `createSolRecordInstruction`
+ * @param connection The Solana RPC connection object
+ * @param domain The .sol domain name
+ * @param record The record enum object
+ * @param data The data (as a UTF-8 string) to store in the record account
+ * @param owner The owner of the domain
+ * @param payer The fee payer of the transaction
+ * @returns
+ */
+export const createRecordInstruction = async (
+  connection: Connection,
+  domain: string,
+  record: Record,
+  data: string,
+  owner: PublicKey,
+  payer: PublicKey
+) => {
+  check(record !== Record.SOL, ErrorType.UnsupportedRecord);
+  const { pubkey, hashed, parent } = getDomainKeySync(
+    `${record}.${domain}`,
+    true
+  );
+
+  const serialized = serializeRecord(data, record);
+  const space = serialized.length;
+  const lamports = await connection.getMinimumBalanceForRentExemption(
+    space + NameRegistryState.HEADER_LEN
+  );
+
+  const ix = createInstruction(
+    NAME_PROGRAM_ID,
+    SystemProgram.programId,
+    pubkey,
+    owner,
+    payer,
+    hashed,
+    new Numberu64(lamports),
+    new Numberu32(space),
+    undefined,
+    parent,
+    owner
+  );
+
+  return ix;
+};
+
+export const updateRecordInstruction = async (
+  connection: Connection,
+  domain: string,
+  record: Record,
+  data: string,
+  owner: PublicKey,
+  payer: PublicKey
+) => {
+  check(record !== Record.SOL, ErrorType.UnsupportedRecord);
+  const { pubkey } = getDomainKeySync(`${record}.${domain}`, true);
+
+  const info = await connection.getAccountInfo(pubkey);
+  check(!!info?.data, ErrorType.AccountDoesNotExist);
+
+  const serialized = serializeRecord(data, record);
+  if (info?.data.slice(96).length !== serialized.length) {
+    // Delete + create until we can realloc accounts
+    return [
+      deleteInstruction(NAME_PROGRAM_ID, pubkey, payer, owner),
+      await createRecordInstruction(
+        connection,
+        domain,
+        record,
+        data,
+        owner,
+        payer
+      ),
+    ];
+  }
+
+  const ix = updateInstruction(
+    NAME_PROGRAM_ID,
+    pubkey,
+    new Numberu32(0),
+    serialized,
+    owner
+  );
+
+  return [ix];
+};
+
+/**
+ * This function can be used to create a SOL record
+ * @param connection The Solana RPC connection object
+ * @param domain The .sol domain name
+ * @param content The content of the SOL record i.e the public key to store as destination of the domain
+ * @param signer The signer of the SOL record i.e the owner of the domain
+ * @param signature The signature of the record
+ * @param payer The fee payer of the transaction
+ * @returns
+ */
+export const createSolRecordInstruction = async (
+  connection: Connection,
+  domain: string,
+  content: PublicKey,
+  signer: PublicKey,
+  signature: Uint8Array,
+  payer: PublicKey
+) => {
+  const { pubkey, hashed, parent } = getDomainKeySync(
+    `${Record.SOL}.${domain}`,
+    true
+  );
+  const serialized = serializeSolRecord(content, pubkey, signer, signature);
+  const space = serialized.length;
+  const lamports = await connection.getMinimumBalanceForRentExemption(
+    space + NameRegistryState.HEADER_LEN
+  );
+
+  const ix = createInstruction(
+    NAME_PROGRAM_ID,
+    SystemProgram.programId,
+    pubkey,
+    signer,
+    payer,
+    hashed,
+    new Numberu64(lamports),
+    new Numberu32(space),
+    undefined,
+    parent,
+    signer
+  );
+
+  return [ix];
+};
+
+export const updateSolRecordInstruction = async (
+  connection: Connection,
+  domain: string,
+  content: PublicKey,
+  signer: PublicKey,
+  signature: Uint8Array,
+  payer: PublicKey
+) => {
+  const { pubkey } = getDomainKeySync(`${Record.SOL}.${domain}`, true);
+
+  const info = await connection.getAccountInfo(pubkey);
+  check(!!info?.data, ErrorType.AccountDoesNotExist);
+
+  if (info?.data.length !== 96) {
+    return [
+      deleteInstruction(NAME_PROGRAM_ID, pubkey, payer, signer),
+      await createSolRecordInstruction(
+        connection,
+        domain,
+        content,
+        signer,
+        signature,
+        payer
+      ),
+    ];
+  }
+
+  const serialized = serializeSolRecord(content, pubkey, signer, signature);
+  const ix = updateInstruction(
+    NAME_PROGRAM_ID,
+    pubkey,
+    new Numberu32(0),
+    serialized,
+    signer
+  );
+
+  return [ix];
+};
+
+import { Connection, PublicKey, MemcmpFilter } from "@solana/web3.js";
+import BN from "bn.js";
+import { sha256 } from "@ethersproject/sha2";
+import { HASH_PREFIX, NAME_PROGRAM_ID, ROOT_DOMAIN_ACCOUNT } from "./constants";
+import { NameRegistryState } from "./state";
+import { REVERSE_LOOKUP_CLASS } from "./constants";
+import { Buffer } from "buffer";
+import { ErrorType, SNSError } from "./error";
+
+export const getHashedNameSync = (name: string): Buffer => {
+  const input = HASH_PREFIX + name;
+  const str = sha256(Buffer.from(input, "utf8")).slice(2);
+  return Buffer.from(str, "hex");
+};
+
+export const getNameAccountKeySync = (
+  hashed_name: Buffer,
+  nameClass?: PublicKey,
+  nameParent?: PublicKey
+): PublicKey => {
+  const seeds = [hashed_name];
+  if (nameClass) {
+    seeds.push(nameClass.toBuffer());
+  } else {
+    seeds.push(Buffer.alloc(32));
+  }
+  if (nameParent) {
+    seeds.push(nameParent.toBuffer());
+  } else {
+    seeds.push(Buffer.alloc(32));
+  }
+  const [nameAccountKey] = PublicKey.findProgramAddressSync(
+    seeds,
+    NAME_PROGRAM_ID
+  );
+  return nameAccountKey;
+};
+
+/**
+ * This function can be used to perform a reverse look up
+ * @param connection The Solana RPC connection
+ * @param nameAccount The public key of the domain to look up
+ * @returns The human readable domain name
+ */
+export async function reverseLookup(
+  connection: Connection,
+  nameAccount: PublicKey
+): Promise<string> {
+  const hashedReverseLookup = getHashedNameSync(nameAccount.toBase58());
+  const reverseLookupAccount = getNameAccountKeySync(
+    hashedReverseLookup,
+    REVERSE_LOOKUP_CLASS
+  );
+
+  const { registry } = await NameRegistryState.retrieve(
+    connection,
+    reverseLookupAccount
+  );
+  if (!registry.data) {
+    throw new SNSError(ErrorType.NoAccountData);
+  }
+  const nameLength = new BN(registry.data.slice(0, 4), "le").toNumber();
+  return registry.data.slice(4, 4 + nameLength).toString();
+}
+
+/**
+ * This function can be used to perform a reverse look up
+ * @param connection The Solana RPC connection
+ * @param nameAccount The public keys of the domains to look up
+ * @returns The human readable domain names
+ */
+export async function reverseLookupBatch(
+  connection: Connection,
+  nameAccounts: PublicKey[]
+): Promise<(string | undefined)[]> {
+  let reverseLookupAccounts: PublicKey[] = [];
+  for (let nameAccount of nameAccounts) {
+    const hashedReverseLookup = getHashedNameSync(nameAccount.toBase58());
+    const reverseLookupAccount = getNameAccountKeySync(
+      hashedReverseLookup,
+      REVERSE_LOOKUP_CLASS
+    );
+    reverseLookupAccounts.push(reverseLookupAccount);
+  }
+
+  let names = await NameRegistryState.retrieveBatch(
+    connection,
+    reverseLookupAccounts
+  );
+
+  return names.map((name) => {
+    if (name === undefined || name.data === undefined) {
+      return undefined;
+    }
+    let nameLength = new BN(name.data.slice(0, 4), "le").toNumber();
+    return name.data.slice(4, 4 + nameLength).toString();
+  });
+}
+
+/**
+ *
+ * @param connection The Solana RPC connection object
+ * @param parentKey The parent you want to find sub-domains for
+ * @returns
+ */
+export const findSubdomains = async (
+  connection: Connection,
+  parentKey: PublicKey
+): Promise<string[]> => {
+  // Fetch reverse accounts
+  const filtersReverse: MemcmpFilter[] = [
+    {
+      memcmp: {
+        offset: 0,
+        bytes: parentKey.toBase58(),
+      },
+    },
+    {
+      memcmp: {
+        offset: 64,
+        bytes: REVERSE_LOOKUP_CLASS.toBase58(),
+      },
+    },
+  ];
+  const reverse = await connection.getProgramAccounts(NAME_PROGRAM_ID, {
+    filters: filtersReverse,
+  });
+
+  const parent = await reverseLookup(connection, parentKey);
+  const subs = reverse.map((e) =>
+    e.account.data.slice(97).toString("utf-8")?.split("\0").join("")
+  );
+
+  const keys = subs.map((e) => getDomainKeySync(e + "." + parent).pubkey);
+  const subsAcc = await connection.getMultipleAccountsInfo(keys);
+
+  return subs.filter((_, idx) => !!subsAcc[idx]);
+};
+
+const _deriveSync = (name: string, parent: PublicKey = ROOT_DOMAIN_ACCOUNT) => {
+  let hashed = getHashedNameSync(name);
+  let pubkey = getNameAccountKeySync(hashed, undefined, parent);
+  return { pubkey, hashed };
+};
+
+/**
+ * This function can be used to compute the public key of a domain or subdomain
+ * @param domain The domain to compute the public key for (e.g `bonfida.sol`, `dex.bonfida.sol`)
+ * @param record Optional parameter: If the domain being resolved is a record
+ * @returns
+ */
+export const getDomainKeySync = (domain: string, record = false) => {
+  if (domain.endsWith(".sol")) {
+    domain = domain.slice(0, -4);
+  }
+  const splitted = domain.split(".");
+  if (splitted.length === 2) {
+    const prefix = Buffer.from([record ? 1 : 0]).toString();
+    const sub = prefix.concat(splitted[0]);
+    const { pubkey: parentKey } = _deriveSync(splitted[1]);
+    const result = _deriveSync(sub, parentKey);
+    return { ...result, isSub: true, parent: parentKey };
+  } else if (splitted.length === 3 && record) {
+    // Parent key
+    const { pubkey: parentKey } = _deriveSync(splitted[2]);
+    // Sub domain
+    const { pubkey: subKey } = _deriveSync("\0".concat(splitted[1]), parentKey);
+    // Sub record
+    const recordPrefix = Buffer.from([1]).toString();
+    const result = _deriveSync(recordPrefix.concat(splitted[0]), subKey);
+    return { ...result, isSub: true, parent: parentKey, isSubRecord: true };
+  } else if (splitted.length >= 3) {
+    throw new SNSError(ErrorType.InvalidInput);
+  }
+  const result = _deriveSync(domain, ROOT_DOMAIN_ACCOUNT);
+  return { ...result, isSub: false, parent: undefined };
+};
+
+/**
+ * This function can be used to retrieve all domain names owned by `wallet`
+ * @param connection The Solana RPC connection object
+ * @param wallet The wallet you want to search domain names for
+ * @returns
+ */
+export async function getAllDomains(
+  connection: Connection,
+  wallet: PublicKey
+): Promise<PublicKey[]> {
+  const filters = [
+    {
+      memcmp: {
+        offset: 32,
+        bytes: wallet.toBase58(),
+      },
+    },
+    {
+      memcmp: {
+        offset: 0,
+        bytes: ROOT_DOMAIN_ACCOUNT.toBase58(),
+      },
+    },
+  ];
+  const accounts = await connection.getProgramAccounts(NAME_PROGRAM_ID, {
+    filters,
+  });
+  return accounts.map((a) => a.pubkey);
+}
+
+/**
+ * This function can be used to retrieve all the registered `.sol` domains.
+ * The account data is sliced to avoid enormous payload and only the owner is returned
+ * @param connection The Solana RPC connection object
+ * @returns
+ */
+export const getAllRegisteredDomains = async (connection: Connection) => {
+  const filters = [
+    {
+      memcmp: {
+        offset: 0,
+        bytes: ROOT_DOMAIN_ACCOUNT.toBase58(),
+      },
+    },
+  ];
+  const dataSlice = { offset: 32, length: 32 };
+
+  const accounts = await connection.getProgramAccounts(NAME_PROGRAM_ID, {
+    dataSlice,
+    filters,
+  });
+  return accounts;
+};
+
+/**
+ * This function can be used to get the key of the reverse account
+ * @param domain The domain to compute the reverse for
+ * @param isSub Whether the domain is a subdomain or not
+ * @returns The public key of the reverse account
+ */
+export const getReverseKeySync = (domain: string, isSub?: boolean) => {
+  const { pubkey, parent } = getDomainKeySync(domain);
+  const hashedReverseLookup = getHashedNameSync(pubkey.toBase58());
+  const reverseLookupAccount = getNameAccountKeySync(
+    hashedReverseLookup,
+    REVERSE_LOOKUP_CLASS,
+    isSub ? parent : undefined
+  );
+  return reverseLookupAccount;
+};
+
+export const check = (bool: boolean, errorType: ErrorType) => {
+  if (!bool) {
+    throw new SNSError(errorType);
+  }
+};
+
+import { PublicKey } from "@solana/web3.js";
+
+/**
+ * The Solana Name Service program ID
+ */
+export const NAME_PROGRAM_ID = new PublicKey(
+  "namesLPneVptA9Z5rqUDD9tMTWEJwofgaYwp8cawRkX"
+);
+
+/**
+ * Hash prefix used to derive domain name addresses
+ */
+export const HASH_PREFIX = "SPL Name Service";
+
+/**
+ * The `.sol` TLD
+ */
+export const ROOT_DOMAIN_ACCOUNT = new PublicKey(
+  "58PwtjSDuFHuUkYjH9BYnnQKHfwo9reZhC2zMJv9JPkx"
+);
+
+/**
+ * The Registry program ID
+ */
+export const REGISTER_PROGRAM_ID = new PublicKey(
+  "jCebN34bUfdeUYJT13J1yG16XWQpt5PDx6Mse9GUqhR"
+);
+
+/**
+ * The FIDA Pyth price feed
+ */
+export const PYTH_FIDA_PRICE_ACC = new PublicKey(
+  "ETp9eKXVv1dWwHSpsXRUuXHmw24PwRkttCGVgpZEY9zF"
+);
+
+/**
+ * The FIDA buy and burn address
+ */
+export const BONFIDA_FIDA_BNB = new PublicKey(
+  "AUoZ3YAhV3b2rZeEH93UMZHXUZcTramBvb4d9YEVySkc"
+);
+
+/**
+ * The reverse look up class
+ */
+export const REVERSE_LOOKUP_CLASS = new PublicKey(
+  "33m47vH6Eav6jr5Ry86XjhRft2jRBLDnDgPSHoquXi2Z"
+);
+
+/**
+ * The `.twitter` TLD authority
+ */
+export const TWITTER_VERIFICATION_AUTHORITY = new PublicKey(
+  "FvPH7PrVrLGKPfqaf3xJodFTjZriqrAXXLTVWEorTFBi"
+);
+
+/**
+ * The `.twitter` TLD
+ */
+export const TWITTER_ROOT_PARENT_REGISTRY_KEY = new PublicKey(
+  "4YcexoW3r78zz16J2aqmukBLRwGq6rAvWzJpkYAXqebv"
+);
+
+/**
+ * The length of the SOL record signature
+ */
+export const SOL_RECORD_SIG_LEN = 96;
+
+export const BONFIDA_USDC_BNB = new PublicKey(
+  "DmSyHDSM9eSLyvoLsPvDr5fRRFZ7Bfr3h3ULvWpgQaq7"
+);
+
+export const USDC_MINT = new PublicKey(
+  "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+);
+
+export const REFERRERS: PublicKey[] = [
+  new PublicKey("3ogYncmMM5CmytsGCqKHydmXmKUZ6sGWvizkzqwT7zb1"), // Test wallet,
+  new PublicKey("DM1jJCkZZEwY5tmWbgvKRxsDFzXCdbfrYCCH1CtwguEs"), // 4Everland
+  new PublicKey("ADCp4QXFajHrhy4f43pD6GJFtQLkdBY2mjS9DfCk7tNW"), // Bandit network
+  new PublicKey("2XTgjw8yi1E3Etgj4CUyRD7Zk49gynH2U9gA5N2MY4NP"), // Altoscan
+  new PublicKey("5oDWj8vr3vbcq9JZTtwXqrkCMZggMsDzNietvbr1BNfe"), // Solscan
+];
+
+export const TOKENS_SYM_MINT = new Map<string, string>([
+  ["EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "USDC"],
+  ["Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", "USDT"],
+  ["So11111111111111111111111111111111111111112", "SOL"],
+  ["EchesyfXePKdLtoiZSL8pBe8Myagyy8ZRqsACNCFGnvp", "FIDA"],
+  ["FeGn77dhg1KXRRFeSwwMiykZnZPw5JXW6naf2aQgZDQf", "ETH"],
+  ["7i5KKsX2weiTkry7jA4ZwSuXGhs5eJBEjY8vVxR4pfRx", "GMT"],
+  ["AFbX8oGjGpmVFywbVouvhQSRmiW2aR1mohfahi4Y2AdB", "GST"],
+  ["mSoLzYCxHdYgdzU16g5QSh3i5K3z3KZK7ytfqcJm7So", "MSOL"],
+  ["DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263", "BONK"],
+  ["EPeUFDgHRxs9xxEPVaL6kfGQvCon7jmAWKVUHuux1Tpz", "BAT"],
+]);
+
+export const PYTH_MAPPING_ACC = new PublicKey(
+  "AHtgzX45WTKfkPG53L6WYhGEXwQkN1BVknET3sVsLL8J"
+);
+
+export const VAULT_OWNER = new PublicKey(
+  "GcWEQ9K78FV7LEHteFVciYApERk5YvQuFDQPk1yYJVXi"
+);
+
+import { Buffer } from "buffer";
+import {
+  PublicKey,
+  TransactionInstruction,
+  SystemProgram,
+} from "@solana/web3.js";
+import { TOKEN_PROGRAM_ID } from "@solana/spl-token";
+import { Numberu32, Numberu64 } from "./int";
+import { Schema, serialize } from "borsh";
+import { ErrorType, SNSError } from "./error";
+
+export interface AccountKey {
+  pubkey: PublicKey;
+  isSigner: boolean;
+  isWritable: boolean;
+}
+
+export function createInstruction(
+  nameProgramId: PublicKey,
+  systemProgramId: PublicKey,
+  nameKey: PublicKey,
+  nameOwnerKey: PublicKey,
+  payerKey: PublicKey,
+  hashed_name: Buffer,
+  lamports: Numberu64,
+  space: Numberu32,
+  nameClassKey?: PublicKey,
+  nameParent?: PublicKey,
+  nameParentOwner?: PublicKey
+): TransactionInstruction {
+  const buffers = [
+    Buffer.from(Int8Array.from([0])),
+    //@ts-ignore
+    new Numberu32(hashed_name.length).toBuffer(),
+    hashed_name,
+    lamports.toBuffer(),
+    space.toBuffer(),
+  ];
+
+  const data = Buffer.concat(buffers);
+
+  const keys = [
+    {
+      pubkey: systemProgramId,
+      isSigner: false,
+      isWritable: false,
+    },
+    {
+      pubkey: payerKey,
+      isSigner: true,
+      isWritable: true,
+    },
+    {
+      pubkey: nameKey,
+      isSigner: false,
+      isWritable: true,
+    },
+    {
+      pubkey: nameOwnerKey,
+      isSigner: false,
+      isWritable: false,
+    },
+  ];
+
+  if (nameClassKey) {
+    keys.push({
+      pubkey: nameClassKey,
+      isSigner: true,
+      isWritable: false,
+    });
+  } else {
+    keys.push({
+      pubkey: new PublicKey(Buffer.alloc(32)),
+      isSigner: false,
+      isWritable: false,
+    });
+  }
+  if (nameParent) {
+    keys.push({
+      pubkey: nameParent,
+      isSigner: false,
+      isWritable: false,
+    });
+  } else {
+    keys.push({
+      pubkey: new PublicKey(Buffer.alloc(32)),
+      isSigner: false,
+      isWritable: false,
+    });
+  }
+  if (nameParentOwner) {
+    keys.push({
+      pubkey: nameParentOwner,
+      isSigner: true,
+      isWritable: false,
+    });
+  }
+
+  return new TransactionInstruction({
+    keys,
+    programId: nameProgramId,
+    data,
+  });
+}
+
+export function updateInstruction(
+  nameProgramId: PublicKey,
+  nameAccountKey: PublicKey,
+  offset: Numberu32,
+  input_data: Buffer,
+  nameUpdateSigner: PublicKey
+): TransactionInstruction {
+  const buffers = [
+    Buffer.from(Int8Array.from([1])),
+    offset.toBuffer(),
+    //@ts-ignore
+    new Numberu32(input_data.length).toBuffer(),
+    input_data,
+  ];
+
+  const data = Buffer.concat(buffers);
+  const keys = [
+    {
+      pubkey: nameAccountKey,
+      isSigner: false,
+      isWritable: true,
+    },
+    {
+      pubkey: nameUpdateSigner,
+      isSigner: true,
+      isWritable: false,
+    },
+  ];
+
+  return new TransactionInstruction({
+    keys,
+    programId: nameProgramId,
+    data,
+  });
+}
+
+export function transferInstruction(
+  nameProgramId: PublicKey,
+  nameAccountKey: PublicKey,
+  newOwnerKey: PublicKey,
+  currentNameOwnerKey: PublicKey,
+  nameClassKey?: PublicKey,
+  nameParent?: PublicKey,
+  parentOwner?: PublicKey
+): TransactionInstruction {
+  const buffers = [Buffer.from(Int8Array.from([2])), newOwnerKey.toBuffer()];
+
+  const data = Buffer.concat(buffers);
+
+  const keys = [
+    {
+      pubkey: nameAccountKey,
+      isSigner: false,
+      isWritable: true,
+    },
+    {
+      pubkey: parentOwner ? parentOwner : currentNameOwnerKey,
+      isSigner: true,
+      isWritable: false,
+    },
+  ];
+
+  if (nameClassKey) {
+    keys.push({
+      pubkey: nameClassKey,
+      isSigner: true,
+      isWritable: false,
+    });
+  }
+
+  if (parentOwner && nameParent) {
+    if (!nameClassKey) {
+      keys.push({
+        pubkey: PublicKey.default,
+        isSigner: false,
+        isWritable: false,
+      });
+    }
+    keys.push({
+      pubkey: nameParent,
+      isSigner: false,
+      isWritable: false,
+    });
+  }
+
+  return new TransactionInstruction({
+    keys,
+    programId: nameProgramId,
+    data,
+  });
+}
+
+export function deleteInstruction(
+  nameProgramId: PublicKey,
+  nameAccountKey: PublicKey,
+  refundTargetKey: PublicKey,
+  nameOwnerKey: PublicKey
+): TransactionInstruction {
+  const buffers = [Buffer.from(Int8Array.from([3]))];
+
+  const data = Buffer.concat(buffers);
+  const keys = [
+    {
+      pubkey: nameAccountKey,
+      isSigner: false,
+      isWritable: true,
+    },
+    {
+      pubkey: nameOwnerKey,
+      isSigner: true,
+      isWritable: false,
+    },
+    {
+      pubkey: refundTargetKey,
+      isSigner: false,
+      isWritable: true,
+    },
+  ];
+
+  return new TransactionInstruction({
+    keys,
+    programId: nameProgramId,
+    data,
+  });
+}
+
+export class createV2Instruction {
+  tag: number;
+  name: string;
+  space: number;
+
+  static schema: Schema = new Map([
+    [
+      createV2Instruction,
+      {
+        kind: "struct",
+        fields: [
+          ["tag", "u8"],
+          ["name", "string"],
+          ["space", "u32"],
+        ],
+      },
+    ],
+  ]);
+
+  constructor(obj: { name: string; space: number }) {
+    this.tag = 9;
+    this.name = obj.name;
+    this.space = obj.space;
+  }
+
+  serialize(): Uint8Array {
+    return serialize(createV2Instruction.schema, this);
+  }
+
+  getInstruction(
+    programId: PublicKey,
+    rentSysvarAccount: PublicKey,
+    nameProgramId: PublicKey,
+    rootDomain: PublicKey,
+    nameAccount: PublicKey,
+    reverseLookupAccount: PublicKey,
+    centralState: PublicKey,
+    buyer: PublicKey,
+    buyerTokenAccount: PublicKey,
+    usdcVault: PublicKey,
+    state: PublicKey
+  ): TransactionInstruction {
+    const data = Buffer.from(this.serialize());
+    const keys = [
+      {
+        pubkey: rentSysvarAccount,
+        isSigner: false,
+        isWritable: false,
+      },
+      {
+        pubkey: nameProgramId,
+        isSigner: false,
+        isWritable: false,
+      },
+      {
+        pubkey: rootDomain,
+        isSigner: false,
+        isWritable: false,
+      },
+      {
+        pubkey: nameAccount,
+        isSigner: false,
+        isWritable: true,
+      },
+      {
+        pubkey: reverseLookupAccount,
+        isSigner: false,
+        isWritable: true,
+      },
+      {
+        pubkey: SystemProgram.programId,
+        isSigner: false,
+        isWritable: false,
+      },
+      {
+        pubkey: centralState,
+        isSigner: false,
+        isWritable: false,
+      },
+      {
+        pubkey: buyer,
+        isSigner: true,
+        isWritable: true,
+      },
+      {
+        pubkey: buyerTokenAccount,
+        isSigner: false,
+        isWritable: true,
+      },
+      {
+        pubkey: usdcVault,
+        isSigner: false,
+        isWritable: true,
+      },
+      {
+        pubkey: TOKEN_PROGRAM_ID,
+        isSigner: false,
+        isWritable: false,
+      },
+      {
+        pubkey: state,
+        isSigner: false,
+        isWritable: false,
+      },
+    ];
+
+    return new TransactionInstruction({
+      keys,
+      programId,
+      data,
+    });
+  }
+}
+
+export class createReverseInstruction {
+  tag: number;
+  name: string;
+
+  static schema: Schema = new Map([
+    [
+      createReverseInstruction,
+      {
+        kind: "struct",
+        fields: [
+          ["tag", "u8"],
+          ["name", "string"],
+        ],
+      },
+    ],
+  ]);
+
+  constructor(obj: { name: string }) {
+    this.tag = 5;
+    this.name = obj.name;
+  }
+
+  serialize(): Uint8Array {
+    return serialize(createReverseInstruction.schema, this);
+  }
+
+  getInstruction(
+    programId: PublicKey,
+    rentSysvarAccount: PublicKey,
+    namingServiceProgram: PublicKey,
+    rootDomain: PublicKey,
+    reverseLookupAccount: PublicKey,
+    centralStateAccount: PublicKey,
+    feePayer: PublicKey,
+    parentName?: PublicKey,
+    parentNameOwner?: PublicKey
+  ): TransactionInstruction {
+    const data = Buffer.from(this.serialize());
+    let keys = [
+      {
+        pubkey: rentSysvarAccount,
+        isSigner: false,
+        isWritable: false,
+      },
+      {
+        pubkey: namingServiceProgram,
+        isSigner: false,
+        isWritable: false,
+      },
+      {
+        pubkey: rootDomain,
+        isSigner: false,
+        isWritable: false,
+      },
+      {
+        pubkey: reverseLookupAccount,
+        isSigner: false,
+        isWritable: true,
+      },
+      {
+        pubkey: PublicKey.default,
+        isSigner: false,
+        isWritable: false,
+      },
+      {
+        pubkey: centralStateAccount,
+        isSigner: false,
+        isWritable: false,
+      },
+      {
+        pubkey: feePayer,
+        isSigner: true,
+        isWritable: true,
+      },
+    ];
+
+    if (parentName) {
+      if (!parentNameOwner) {
+        throw new SNSError(ErrorType.MissingParentOwner);
+      }
+      keys.push({
+        pubkey: parentName,
+        isSigner: false,
+        isWritable: true,
+      });
+      keys.push({
+        pubkey: parentNameOwner,
+        isSigner: true,
+        isWritable: false,
+      });
+    }
+
+    return new TransactionInstruction({
+      keys,
+      programId,
+      data,
+    });
+  }
+}
+
+export class createInstructionV3 {
+  tag: number;
+  name: string;
+  space: number;
+  referrerIdxOpt: number | null;
+  static schema: Schema = new Map([
+    [
+      createInstructionV3,
+      {
+        kind: "struct",
+        fields: [
+          ["tag", "u8"],
+          ["name", "string"],
+          ["space", "u32"],
+          ["referrerIdxOpt", { kind: "option", type: "u16" }],
+        ],
+      },
+    ],
+  ]);
+  constructor(obj: {
+    name: string;
+    space: number;
+    referrerIdxOpt: number | null;
+  }) {
+    this.tag = 13;
+    this.name = obj.name;
+    this.space = obj.space;
+    this.referrerIdxOpt = obj.referrerIdxOpt;
+  }
+  serialize(): Uint8Array {
+    return serialize(createInstructionV3.schema, this);
+  }
+  getInstruction(
+    programId: PublicKey,
+    namingServiceProgram: PublicKey,
+    rootDomain: PublicKey,
+    name: PublicKey,
+    reverseLookup: PublicKey,
+    systemProgram: PublicKey,
+    centralState: PublicKey,
+    buyer: PublicKey,
+    buyerTokenSource: PublicKey,
+    pythMappingAcc: PublicKey,
+    pythProductAcc: PublicKey,
+    pythPriceAcc: PublicKey,
+    vault: PublicKey,
+    splTokenProgram: PublicKey,
+    rentSysvar: PublicKey,
+    state: PublicKey,
+    referrerAccountOpt?: PublicKey
+  ): TransactionInstruction {
+    const data = Buffer.from(this.serialize());
+    let keys: AccountKey[] = [];
+    keys.push({
+      pubkey: namingServiceProgram,
+      isSigner: false,
+      isWritable: false,
+    });
+    keys.push({
+      pubkey: rootDomain,
+      isSigner: false,
+      isWritable: false,
+    });
+    keys.push({
+      pubkey: name,
+      isSigner: false,
+      isWritable: true,
+    });
+    keys.push({
+      pubkey: reverseLookup,
+      isSigner: false,
+      isWritable: true,
+    });
+    keys.push({
+      pubkey: systemProgram,
+      isSigner: false,
+      isWritable: false,
+    });
+    keys.push({
+      pubkey: centralState,
+      isSigner: false,
+      isWritable: false,
+    });
+    keys.push({
+      pubkey: buyer,
+      isSigner: true,
+      isWritable: true,
+    });
+    keys.push({
+      pubkey: buyerTokenSource,
+      isSigner: false,
+      isWritable: true,
+    });
+    keys.push({
+      pubkey: pythMappingAcc,
+      isSigner: false,
+      isWritable: false,
+    });
+    keys.push({
+      pubkey: pythProductAcc,
+      isSigner: false,
+      isWritable: false,
+    });
+    keys.push({
+      pubkey: pythPriceAcc,
+      isSigner: false,
+      isWritable: false,
+    });
+    keys.push({
+      pubkey: vault,
+      isSigner: false,
+      isWritable: true,
+    });
+    keys.push({
+      pubkey: splTokenProgram,
+      isSigner: false,
+      isWritable: false,
+    });
+    keys.push({
+      pubkey: rentSysvar,
+      isSigner: false,
+      isWritable: false,
+    });
+    keys.push({
+      pubkey: state,
+      isSigner: false,
+      isWritable: false,
+    });
+    if (!!referrerAccountOpt) {
+      keys.push({
+        pubkey: referrerAccountOpt,
+        isSigner: false,
+        isWritable: true,
+      });
+    }
+    return new TransactionInstruction({
+      keys,
+      programId,
+      data,
+    });
+  }
+}
+
+import {
+  Connection,
+  PublicKey,
+  SystemProgram,
+  TransactionInstruction,
+} from "@solana/web3.js";
+import {
+  NAME_PROGRAM_ID,
+  TWITTER_VERIFICATION_AUTHORITY,
+  TWITTER_ROOT_PARENT_REGISTRY_KEY,
+} from "./constants";
+import { deleteNameRegistry } from "./bindings";
+import {
+  createInstruction,
+  deleteInstruction,
+  transferInstruction,
+  updateInstruction,
+} from "./instructions";
+import { NameRegistryState } from "./state";
+import { getHashedName, getNameAccountKey } from "./deprecated/utils";
+import { Numberu32, Numberu64 } from "./int";
+import { deserializeUnchecked, Schema, serialize } from "borsh";
+import { Buffer } from "buffer";
+import { ErrorType, SNSError } from "./error";
+
+////////////////////////////////////////////////////
+// Bindings
+
+// Signed by the authority, the payer and the verified pubkey
+export async function createVerifiedTwitterRegistry(
+  connection: Connection,
+  twitterHandle: string,
+  verifiedPubkey: PublicKey,
+  space: number, // The space that the user will have to write data into the verified registry
+  payerKey: PublicKey
+): Promise<TransactionInstruction[]> {
+  // Create user facing registry
+  const hashedTwitterHandle = await getHashedName(twitterHandle);
+  const twitterHandleRegistryKey = await getNameAccountKey(
+    hashedTwitterHandle,
+    undefined,
+    TWITTER_ROOT_PARENT_REGISTRY_KEY
+  );
+
+  const lamports = await connection.getMinimumBalanceForRentExemption(
+    space + NameRegistryState.HEADER_LEN
+  );
+
+  let instructions = [
+    createInstruction(
+      NAME_PROGRAM_ID,
+      SystemProgram.programId,
+      twitterHandleRegistryKey,
+      verifiedPubkey,
+      payerKey,
+      hashedTwitterHandle,
+      //@ts-ignore
+      new Numberu64(lamports),
+      //@ts-ignore
+      new Numberu32(space),
+      undefined,
+      TWITTER_ROOT_PARENT_REGISTRY_KEY,
+      TWITTER_VERIFICATION_AUTHORITY // Twitter authority acts as owner of the parent for all user-facing registries
+    ),
+  ];
+
+  instructions = instructions.concat(
+    await createReverseTwitterRegistry(
+      connection,
+      twitterHandle,
+      twitterHandleRegistryKey,
+      verifiedPubkey,
+      payerKey
+    )
+  );
+
+  return instructions;
+}
+
+// Overwrite the data that is written in the user facing registry
+// Signed by the verified pubkey
+export async function changeTwitterRegistryData(
+  twitterHandle: string,
+  verifiedPubkey: PublicKey,
+  offset: number, // The offset at which to write the input data into the NameRegistryData
+  input_data: Buffer
+): Promise<TransactionInstruction[]> {
+  const hashedTwitterHandle = await getHashedName(twitterHandle);
+  const twitterHandleRegistryKey = await getNameAccountKey(
+    hashedTwitterHandle,
+    undefined,
+    TWITTER_ROOT_PARENT_REGISTRY_KEY
+  );
+
+  const instructions = [
+    updateInstruction(
+      NAME_PROGRAM_ID,
+      twitterHandleRegistryKey,
+      //@ts-ignore
+      new Numberu32(offset),
+      input_data,
+      verifiedPubkey
+    ),
+  ];
+
+  return instructions;
+}
+
+// Change the verified pubkey for a given twitter handle
+// Signed by the Authority, the verified pubkey and the payer
+export async function changeVerifiedPubkey(
+  connection: Connection,
+  twitterHandle: string,
+  currentVerifiedPubkey: PublicKey,
+  newVerifiedPubkey: PublicKey,
+  payerKey: PublicKey
+): Promise<TransactionInstruction[]> {
+  const hashedTwitterHandle = await getHashedName(twitterHandle);
+  const twitterHandleRegistryKey = await getNameAccountKey(
+    hashedTwitterHandle,
+    undefined,
+    TWITTER_ROOT_PARENT_REGISTRY_KEY
+  );
+
+  // Transfer the user-facing registry ownership
+  let instructions = [
+    transferInstruction(
+      NAME_PROGRAM_ID,
+      twitterHandleRegistryKey,
+      newVerifiedPubkey,
+      currentVerifiedPubkey,
+      undefined
+    ),
+  ];
+
+  // Delete the current reverse registry
+  const currentHashedVerifiedPubkey = await getHashedName(
+    currentVerifiedPubkey.toString()
+  );
+  const currentReverseRegistryKey = await getNameAccountKey(
+    currentHashedVerifiedPubkey,
+    TWITTER_VERIFICATION_AUTHORITY,
+    undefined
+  );
+  instructions.push(
+    await deleteNameRegistry(
+      connection,
+      currentVerifiedPubkey.toString(),
+      payerKey,
+      TWITTER_VERIFICATION_AUTHORITY,
+      TWITTER_ROOT_PARENT_REGISTRY_KEY
+    )
+  );
+
+  // Create the new reverse registry
+  instructions = instructions.concat(
+    await createReverseTwitterRegistry(
+      connection,
+      twitterHandle,
+      twitterHandleRegistryKey,
+      newVerifiedPubkey,
+      payerKey
+    )
+  );
+
+  return instructions;
+}
+
+// Delete the verified registry for a given twitter handle
+// Signed by the verified pubkey
+export async function deleteTwitterRegistry(
+  twitterHandle: string,
+  verifiedPubkey: PublicKey
+): Promise<TransactionInstruction[]> {
+  const hashedTwitterHandle = await getHashedName(twitterHandle);
+  const twitterHandleRegistryKey = await getNameAccountKey(
+    hashedTwitterHandle,
+    undefined,
+    TWITTER_ROOT_PARENT_REGISTRY_KEY
+  );
+
+  const hashedVerifiedPubkey = await getHashedName(verifiedPubkey.toString());
+  const reverseRegistryKey = await getNameAccountKey(
+    hashedVerifiedPubkey,
+    TWITTER_VERIFICATION_AUTHORITY,
+    TWITTER_ROOT_PARENT_REGISTRY_KEY
+  );
+
+  const instructions = [
+    // Delete the user facing registry
+    deleteInstruction(
+      NAME_PROGRAM_ID,
+      twitterHandleRegistryKey,
+      verifiedPubkey,
+      verifiedPubkey
+    ),
+    // Delete the reverse registry
+    deleteInstruction(
+      NAME_PROGRAM_ID,
+      reverseRegistryKey,
+      verifiedPubkey,
+      verifiedPubkey
+    ),
+  ];
+
+  return instructions;
+}
+
+//////////////////////////////////////////
+// Getter Functions
+
+// Returns the key of the user-facing registry
+export async function getTwitterRegistryKey(
+  twitter_handle: string
+): Promise<PublicKey> {
+  const hashedTwitterHandle = await getHashedName(twitter_handle);
+  return await getNameAccountKey(
+    hashedTwitterHandle,
+    undefined,
+    TWITTER_ROOT_PARENT_REGISTRY_KEY
+  );
+}
+
+export async function getTwitterRegistry(
+  connection: Connection,
+  twitter_handle: string
+): Promise<NameRegistryState> {
+  const hashedTwitterHandle = await getHashedName(twitter_handle);
+  const twitterHandleRegistryKey = await getNameAccountKey(
+    hashedTwitterHandle,
+    undefined,
+    TWITTER_ROOT_PARENT_REGISTRY_KEY
+  );
+  const { registry } = await NameRegistryState.retrieve(
+    connection,
+    twitterHandleRegistryKey
+  );
+  return registry;
+}
+
+export async function getHandleAndRegistryKey(
+  connection: Connection,
+  verifiedPubkey: PublicKey
+): Promise<[string, PublicKey]> {
+  const hashedVerifiedPubkey = await getHashedName(verifiedPubkey.toString());
+  const reverseRegistryKey = await getNameAccountKey(
+    hashedVerifiedPubkey,
+    TWITTER_VERIFICATION_AUTHORITY,
+    TWITTER_ROOT_PARENT_REGISTRY_KEY
+  );
+
+  let reverseRegistryState = await ReverseTwitterRegistryState.retrieve(
+    connection,
+    reverseRegistryKey
+  );
+  return [
+    reverseRegistryState.twitterHandle,
+    new PublicKey(reverseRegistryState.twitterRegistryKey),
+  ];
+}
+
+// Uses the RPC node filtering feature, execution speed may vary
+export async function getTwitterHandleandRegistryKeyViaFilters(
+  connection: Connection,
+  verifiedPubkey: PublicKey
+): Promise<[string, PublicKey]> {
+  const filters = [
+    {
+      memcmp: {
+        offset: 0,
+        bytes: TWITTER_ROOT_PARENT_REGISTRY_KEY.toBase58(),
+      },
+    },
+    {
+      memcmp: {
+        offset: 32,
+        bytes: verifiedPubkey.toBase58(),
+      },
+    },
+    {
+      memcmp: {
+        offset: 64,
+        bytes: TWITTER_VERIFICATION_AUTHORITY.toBase58(),
+      },
+    },
+  ];
+  const filteredAccounts = await connection.getProgramAccounts(
+    NAME_PROGRAM_ID,
+    { filters }
+  );
+
+  for (const f of filteredAccounts) {
+    if (f.account.data.length > NameRegistryState.HEADER_LEN + 32) {
+      let data = f.account.data.slice(NameRegistryState.HEADER_LEN);
+      let state: ReverseTwitterRegistryState = deserializeUnchecked(
+        ReverseTwitterRegistryState.schema,
+        ReverseTwitterRegistryState,
+        data
+      );
+      return [state.twitterHandle, new PublicKey(state.twitterRegistryKey)];
+    }
+  }
+  throw new SNSError(ErrorType.AccountDoesNotExist);
+}
+
+// Uses the RPC node filtering feature, execution speed may vary
+// Does not give you the handle, but is an alternative to getHandlesAndKeysFromVerifiedPubkey + getTwitterRegistry to get the data
+export async function getTwitterRegistryData(
+  connection: Connection,
+  verifiedPubkey: PublicKey
+): Promise<Buffer> {
+  const filters = [
+    {
+      memcmp: {
+        offset: 0,
+        bytes: TWITTER_ROOT_PARENT_REGISTRY_KEY.toBase58(),
+      },
+    },
+    {
+      memcmp: {
+        offset: 32,
+        bytes: verifiedPubkey.toBase58(),
+      },
+    },
+    {
+      memcmp: {
+        offset: 64,
+        bytes: new PublicKey(Buffer.alloc(32, 0)).toBase58(),
+      },
+    },
+  ];
+
+  const filteredAccounts = await connection.getProgramAccounts(
+    NAME_PROGRAM_ID,
+    { filters }
+  );
+
+  if (filteredAccounts.length > 1) {
+    throw new SNSError(ErrorType.MultipleRegistries);
+  }
+
+  return filteredAccounts[0].account.data.slice(NameRegistryState.HEADER_LEN);
+}
+
+//////////////////////////////////////////////
+// Utils
+
+export class ReverseTwitterRegistryState {
+  twitterRegistryKey: Uint8Array;
+  twitterHandle: string;
+
+  static schema: Schema = new Map([
+    [
+      ReverseTwitterRegistryState,
+      {
+        kind: "struct",
+        fields: [
+          ["twitterRegistryKey", [32]],
+          ["twitterHandle", "string"],
+        ],
+      },
+    ],
+  ]);
+  constructor(obj: { twitterRegistryKey: Uint8Array; twitterHandle: string }) {
+    this.twitterRegistryKey = obj.twitterRegistryKey;
+    this.twitterHandle = obj.twitterHandle;
+  }
+
+  public static async retrieve(
+    connection: Connection,
+    reverseTwitterAccountKey: PublicKey
+  ): Promise<ReverseTwitterRegistryState> {
+    let reverseTwitterAccount = await connection.getAccountInfo(
+      reverseTwitterAccountKey,
+      "processed"
+    );
+    if (!reverseTwitterAccount) {
+      throw new SNSError(ErrorType.InvalidReverseTwitter);
+    }
+
+    let res: ReverseTwitterRegistryState = deserializeUnchecked(
+      this.schema,
+      ReverseTwitterRegistryState,
+      reverseTwitterAccount.data.slice(NameRegistryState.HEADER_LEN)
+    );
+
+    return res;
+  }
+}
+
+export async function createReverseTwitterRegistry(
+  connection: Connection,
+  twitterHandle: string,
+  twitterRegistryKey: PublicKey,
+  verifiedPubkey: PublicKey,
+  payerKey: PublicKey
+): Promise<TransactionInstruction[]> {
+  // Create the reverse lookup registry
+  const hashedVerifiedPubkey = await getHashedName(verifiedPubkey.toString());
+  const reverseRegistryKey = await getNameAccountKey(
+    hashedVerifiedPubkey,
+    TWITTER_VERIFICATION_AUTHORITY,
+    TWITTER_ROOT_PARENT_REGISTRY_KEY
+  );
+  let reverseTwitterRegistryStateBuff = serialize(
+    ReverseTwitterRegistryState.schema,
+    new ReverseTwitterRegistryState({
+      twitterRegistryKey: twitterRegistryKey.toBytes(),
+      twitterHandle,
+    })
+  );
+  return [
+    createInstruction(
+      NAME_PROGRAM_ID,
+      SystemProgram.programId,
+      reverseRegistryKey,
+      verifiedPubkey,
+      payerKey,
+      hashedVerifiedPubkey,
+      new Numberu64(
+        //@ts-ignore
+        await connection.getMinimumBalanceForRentExemption(
+          reverseTwitterRegistryStateBuff.length + NameRegistryState.HEADER_LEN
+        )
+      ),
+      //@ts-ignore
+      new Numberu32(reverseTwitterRegistryStateBuff.length),
+      TWITTER_VERIFICATION_AUTHORITY, // Twitter authority acts as class for all reverse-lookup registries
+      TWITTER_ROOT_PARENT_REGISTRY_KEY, // Reverse registries are also children of the root
+      TWITTER_VERIFICATION_AUTHORITY
+    ),
+    updateInstruction(
+      NAME_PROGRAM_ID,
+      reverseRegistryKey,
+      //@ts-ignore
+      new Numberu32(0),
+      Buffer.from(reverseTwitterRegistryStateBuff),
+      TWITTER_VERIFICATION_AUTHORITY
+    ),
+  ];
+}
+
+export * from "./bindings";
+export * from "./state";
+export * from "./twitter_bindings";
+export * from "./deprecated/tokens";
+export * from "./utils";
+export * from "./instructions";
+export * from "./nft";
+export * from "./favorite-domain";
+export * from "./constants";
+export * from "./int";
+export * from "./record";
+export * from "./types/record";
+export * from "./resolve";
+export * from "./deprecated/utils";
+export * from "./error";
+
+import { Connection, PublicKey } from "@solana/web3.js";
+import { getRecordKeySync, getSolRecord } from "./record";
+import { getDomainKeySync } from "./utils";
+import { NameRegistryState } from "./state";
+import * as tweetnacl from "tweetnacl";
+import { Record } from "./types/record";
+import { Buffer } from "buffer";
+import { ErrorType, SNSError } from "./error";
+
+/**
+ * This function can be used to verify the validity of a SOL record
+ * @param record The record data to verify
+ * @param signedRecord The signed data
+ * @param pubkey The public key of the signer
+ * @returns
+ */
+export const checkSolRecord = (
+  record: Uint8Array,
+  signedRecord: Uint8Array,
+  pubkey: PublicKey
+) => {
+  return tweetnacl.sign.detached.verify(record, signedRecord, pubkey.toBytes());
+};
+
+/**
+ * This function can be used to resolve a domain name to transfer funds
+ * @param connection The Solana RPC connection object
+ * @param domain The domain to resolve
+ * @returns
+ */
+export const resolve = async (connection: Connection, domain: string) => {
+  const { pubkey } = getDomainKeySync(domain);
+
+  const { registry, nftOwner } = await NameRegistryState.retrieve(
+    connection,
+    pubkey
+  );
+
+  if (nftOwner) {
+    return nftOwner;
+  }
+
+  try {
+    const recordKey = getRecordKeySync(domain, Record.SOL);
+    const solRecord = await getSolRecord(connection, domain);
+
+    if (!solRecord?.data) {
+      throw new SNSError(ErrorType.NoRecordData);
+    }
+
+    const encoder = new TextEncoder();
+    const expectedBuffer = Buffer.concat([
+      solRecord.data.slice(0, 32),
+      recordKey.toBuffer(),
+    ]);
+    const expected = encoder.encode(expectedBuffer.toString("hex"));
+
+    const valid = checkSolRecord(
+      expected,
+      solRecord.data.slice(32),
+      registry.owner
+    );
+
+    if (!valid) {
+      throw new SNSError(ErrorType.InvalidSignature);
+    }
+
+    return new PublicKey(solRecord.data.slice(0, 32));
+  } catch (err) {
+    if (err instanceof Error) {
+      if (err.name === "FetchError") {
+        throw err;
+      }
+    }
+  }
+
+  return registry.owner;
+};
+
+export enum ErrorType {
+  SymbolNotFound = "SymbolNotFound",
+  InvalidSubdomain = "InvalidSubdomain",
+  FavouriteDomainNotFound = "FavouriteDomainNotFound",
+  MissingParentOwner = "MissingParentOwner",
+  U32Overflow = "U32Overflow",
+  InvalidBufferLength = "InvalidBufferLength",
+  U64Overflow = "U64Overflow",
+  NoRecordData = "NoRecordData",
+  InvalidRecordData = "InvalidRecordData",
+  UnsupportedRecord = "UnsupportedRecord",
+  InvalidEvmAddress = "InvalidEvmAddress",
+  InvalidInjectiveAddress = "InvalidInjectiveAddress",
+  InvalidARecord = "InvalidARecord",
+  InvalidAAAARecord = "InvalidAAAARecord",
+  InvalidRecordInput = "InvalidRecordInput",
+  InvalidSignature = "InvalidSignature",
+  AccountDoesNotExist = "AccountDoesNotExist",
+  MultipleRegistries = "MultipleRegistries",
+  InvalidReverseTwitter = "InvalidReverseTwitter",
+  NoAccountData = "NoAccountData",
+  InvalidInput = "InvalidInput",
+}
+
+export class SNSError extends Error {
+  type: ErrorType;
+
+  constructor(type: ErrorType, message?: string) {
+    super(message);
+    this.name = "SNSError";
+    this.type = type;
+
+    if (Error.captureStackTrace) {
+      Error.captureStackTrace(this, SNSError);
+    }
+  }
+}
+
+/**
+ * List of SNS Records
+ */
+export enum Record {
+  IPFS = "IPFS",
+  ARWV = "ARWV",
+  SOL = "SOL",
+  ETH = "ETH",
+  BTC = "BTC",
+  LTC = "LTC",
+  DOGE = "DOGE",
+  Email = "email",
+  Url = "url",
+  Discord = "discord",
+  Github = "github",
+  Reddit = "reddit",
+  Twitter = "twitter",
+  Telegram = "telegram",
+  Pic = "pic",
+  SHDW = "SHDW",
+  POINT = "POINT",
+  BSC = "BSC",
+  Injective = "INJ",
+  Backpack = "backpack",
+  A = "A",
+  AAAA = "AAAA",
+  CNAME = "CNAME",
+  TXT = "TXT",
+}
+
+export const RECORD_V1_SIZE: Map<Record, number> = new Map([
+  [Record.SOL, 96],
+  [Record.ETH, 20],
+  [Record.BSC, 20],
+  [Record.Injective, 20],
+  [Record.A, 4],
+  [Record.AAAA, 16],
+]);
+
+import { deserialize, Schema } from "borsh";
+import { Connection, PublicKey } from "@solana/web3.js";
+import { Buffer } from "buffer";
+
+export const NAME_TOKENIZER_ID = new PublicKey(
+  "nftD3vbNkNqfj2Sd3HZwbpw4BxxKWr4AjGb9X38JeZk"
+);
+
+export const MINT_PREFIX = Buffer.from("tokenized_name");
+
+export enum Tag {
+  Uninitialized = 0,
+  CentralState = 1,
+  ActiveRecord = 2,
+  InactiveRecord = 3,
+}
+
+export class NftRecord {
+  tag: Tag;
+  nonce: number;
+  nameAccount: PublicKey;
+  owner: PublicKey;
+  nftMint: PublicKey;
+
+  static schema: Schema = new Map([
+    [
+      NftRecord,
+      {
+        kind: "struct",
+        fields: [
+          ["tag", "u8"],
+          ["nonce", "u8"],
+          ["nameAccount", [32]],
+          ["owner", [32]],
+          ["nftMint", [32]],
+        ],
+      },
+    ],
+  ]);
+
+  constructor(obj: {
+    tag: number;
+    nonce: number;
+    nameAccount: Uint8Array;
+    owner: Uint8Array;
+    nftMint: Uint8Array;
+  }) {
+    this.tag = obj.tag as Tag;
+    this.nonce = obj.nonce;
+    this.nameAccount = new PublicKey(obj.nameAccount);
+    this.owner = new PublicKey(obj.owner);
+    this.nftMint = new PublicKey(obj.nftMint);
+  }
+
+  static deserialize(data: Buffer): NftRecord {
+    return deserialize(this.schema, NftRecord, data);
+  }
+
+  static async retrieve(connection: Connection, key: PublicKey) {
+    const accountInfo = await connection.getAccountInfo(key);
+    if (!accountInfo || !accountInfo.data) {
+      throw new Error("NFT record not found");
+    }
+    return this.deserialize(accountInfo.data);
+  }
+  static async findKey(nameAccount: PublicKey, programId: PublicKey) {
+    return await PublicKey.findProgramAddress(
+      [Buffer.from("nft_record"), nameAccount.toBuffer()],
+      programId
+    );
+  }
+}
+
+/**
+ * This function can be used to retrieve a NFT Record given a mint
+ *
+ * @param connection A solana RPC connection
+ * @param mint The mint of the NFT Record
+ * @returns
+ */
+export const getRecordFromMint = async (
+  connection: Connection,
+  mint: PublicKey
+) => {
+  const filters = [
+    {
+      memcmp: {
+        offset: 0,
+        bytes: "3",
+      },
+    },
+    {
+      memcmp: {
+        offset: 1 + 1 + 32 + 32,
+        bytes: mint.toBase58(),
+      },
+    },
+  ];
+
+  const result = await connection.getProgramAccounts(NAME_TOKENIZER_ID, {
+    filters,
+  });
+
+  return result;
+};
+
+import {
+  PublicKey,
+  Connection,
+  GetProgramAccountsFilter,
+  MemcmpFilter,
+} from "@solana/web3.js";
+import {
+  getMint,
+  TOKEN_PROGRAM_ID,
+  RawAccount,
+  AccountLayout,
+} from "@solana/spl-token";
+import {
+  NAME_TOKENIZER_ID,
+  MINT_PREFIX,
+  NftRecord,
+  getRecordFromMint,
+} from "./name-tokenizer";
+import { reverseLookupBatch } from "../utils";
+
+/**
+ * This function can be used to retrieve the owner of a tokenized domain name
+ *
+ * @param connection The solana connection object to the RPC node
+ * @param nameAccount The key of the domain name
+ * @returns
+ */
+export const retrieveNftOwner = async (
+  connection: Connection,
+  nameAccount: PublicKey
+) => {
+  try {
+    const [mint] = await PublicKey.findProgramAddress(
+      [MINT_PREFIX, nameAccount.toBuffer()],
+      NAME_TOKENIZER_ID
+    );
+
+    const mintInfo = await getMint(connection, mint);
+    if (mintInfo.supply.toString() === "0") {
+      return undefined;
+    }
+
+    const filters: GetProgramAccountsFilter[] = [
+      {
+        memcmp: {
+          offset: 0,
+          bytes: mint.toBase58(),
+        },
+      },
+      {
+        memcmp: {
+          offset: 64,
+          bytes: "2",
+        },
+      },
+      { dataSize: 165 },
+    ];
+
+    const result = await connection.getProgramAccounts(TOKEN_PROGRAM_ID, {
+      filters,
+    });
+
+    if (result.length != 1) {
+      return undefined;
+    }
+
+    return new PublicKey(result[0].account.data.slice(32, 64));
+  } catch {
+    return undefined;
+  }
+};
+
+/**
+ * This function can be used to retrieve all the tokenized domains name
+ *
+ * @param connection The solana connection object to the RPC node
+ * @returns
+ */
+export const retrieveNfts = async (connection: Connection) => {
+  const filters = [
+    {
+      memcmp: {
+        offset: 0,
+        bytes: "3",
+      },
+    },
+  ];
+
+  const result = await connection.getProgramAccounts(NAME_TOKENIZER_ID, {
+    filters,
+  });
+  const offset = 1 + 1 + 32 + 32;
+  return result.map(
+    (e) => new PublicKey(e.account.data.slice(offset, offset + 32))
+  );
+};
+
+const getFilter = (owner: string) => {
+  const filters: MemcmpFilter[] = [
+    {
+      memcmp: { offset: 32, bytes: owner },
+    },
+    { memcmp: { offset: 64, bytes: "2" } },
+  ];
+  return filters;
+};
+
+const closure = async (connection: Connection, acc: RawAccount) => {
+  const record = await getRecordFromMint(connection, acc.mint);
+  if (record.length === 1) {
+    return NftRecord.deserialize(record[0].account.data);
+  }
+};
+
+const retrieveRecords = async (connection: Connection, owner: PublicKey) => {
+  const filters: GetProgramAccountsFilter[] = [
+    ...getFilter(owner.toBase58()),
+    { dataSize: 165 },
+  ];
+  const result = await connection.getProgramAccounts(TOKEN_PROGRAM_ID, {
+    filters,
+  });
+
+  const tokenAccs = result.map((e) => AccountLayout.decode(e.account.data));
+
+  const promises = tokenAccs.map((acc) => closure(connection, acc));
+  const records = await Promise.all(promises);
+
+  return records.filter((e) => e !== undefined) as NftRecord[];
+};
+
+/**
+ * This function can be used to retrieve all the tokenized domains of an owner
+ * @param connection The Solana RPC connection object
+ * @param owner The owner of the tokenized domains
+ * @returns
+ */
+export const getTokenizedDomains = async (
+  connection: Connection,
+  owner: PublicKey
+) => {
+  const nftRecords = await retrieveRecords(connection, owner);
+
+  const names = await reverseLookupBatch(
+    connection,
+    nftRecords.map((e) => e.nameAccount)
+  );
+
+  return names
+    .map((e, idx) => {
+      return {
+        key: nftRecords[idx].nameAccount,
+        mint: nftRecords[idx].nftMint,
+        reverse: e,
+      };
+    })
+    .filter((e) => !!e.reverse);
+};
+
