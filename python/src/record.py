@@ -1,25 +1,62 @@
 import ipaddress
-from types.record import RECORD_V1_SIZE, Record
+from enum import Enum
 from typing import Optional
 
 from errors import ErrorType, SNSError
+from resolve import check_sol_record
 from solana.rpc.api import Client
 from solana.rpc.types import Pubkey
 from state import NameRegistryState
 from utils import get_domain_key_sync
-from resolve import check_sol_record
+
+class Record(Enum):
+    IPFS = "IPFS"
+    ARWV = "ARWV"
+    SOL = "SOL"
+    ETH = "ETH"
+    BTC = "BTC"
+    LTC = "LTC"
+    DOGE = "DOGE"
+    Email = "email"
+    Url = "url"
+    Discord = "discord"
+    Github = "github"
+    Reddit = "reddit"
+    Twitter = "twitter"
+    Telegram = "telegram"
+    Pic = "pic"
+    SHDW = "SHDW"
+    POINT = "POINT"
+    BSC = "BSC"
+    Injective = "INJ"
+    Backpack = "backpack"
+    A = "A"
+    AAAA = "AAAA"
+    CNAME = "CNAME"
+    TXT = "TXT"
+
+
+RECORD_V1_SIZE = {
+    Record.SOL: 96,
+    Record.ETH: 20,
+    Record.BSC: 20,
+    Record.Injective: 20,
+    Record.A: 4,
+    Record.AAAA: 16,
+}
+
 
 def serialize_record(record: Record, data: str) -> bytes:
     size = RECORD_V1_SIZE.get(record)
 
     if not size:
-        if record in (Record.CNAME, Record.TXT): 
-            data_bytes = data.encode("utf-8")  
+        if record in (Record.CNAME, Record.TXT):
+            data_bytes = data.encode("utf-8")
             return bytes(data_bytes)
 
     if record == Record.SOL:
         raise SNSError(
-            error_type=ErrorType.UnsupportedRecordType, 
+            error_type=ErrorType.UnsupportedRecordType,
             message="Use serialize_sol_record instead")
     elif record == Record.ETH or record == Record.BSC:
         if not data.startswith("0x"):
@@ -44,6 +81,7 @@ def serialize_record(record: Record, data: str) -> bytes:
             raise SNSError(error_type=ErrorType.InvalidAAAARecord)
         return bytes(array)
 
+
 def is_valid_network(ip_network):
     try:
         ipaddress.ip_network(ip_network)
@@ -51,16 +89,20 @@ def is_valid_network(ip_network):
     except ValueError:
         return False
 
+
 def get_record_key_sync(domain: str, record: Record) -> str:
     pubkey = get_domain_key_sync(record + "." + domain, True)["pubkey"]
     return pubkey
 
+
 def get_sol_record(connection: Client, domain_pub_key: str) -> Pubkey:
     return get_record(
-        connection=connection, domain=domain_pub_key, 
+        connection=connection, domain=domain_pub_key,
         record=Record.SOL, deserialize=False)
 
 # always use in try catch
+
+
 def get_record(
         connection: Client, domain: str, record: Record, deserialize: bool = True
 ) -> NameRegistryState:
@@ -79,8 +121,10 @@ def get_record(
 
     return registry
 
+
 def decode(str):
     return None
+
 
 def deserializeRecord(
         record: Record,
@@ -115,6 +159,7 @@ def deserializeRecord(
         else:
             SNSError(error_type=ErrorType.InvalidRecordData)
 
+
 def trim_null_padding_idx(buffer: bytes) -> int:
     arr = list(buffer)
     last_non_null = len(
@@ -126,59 +171,78 @@ def trim_null_padding_idx(buffer: bytes) -> int:
 def get_ipfs_record(connection: Client, domain: str) -> Optional[str]:
     return get_record(connection, domain, Record.IPFS, True)
 
+
 def get_arweave_record(connection: Client, domain: str) -> Optional[str]:
     return get_record(connection, domain, Record.ARWV, True)
+
 
 def get_eth_record(connection: Client, domain: str) -> Optional[str]:
     return get_record(connection, domain, Record.ETH, True)
 
+
 def get_btc_record(connection: Client, domain: str) -> Optional[str]:
     return get_record(connection, domain, Record.BTC, True)
+
 
 def get_ltc_record(connection: Client, domain: str) -> Optional[str]:
     return get_record(connection, domain, Record.LTC, True)
 
+
 def get_doge_record(connection: Client, domain: str) -> Optional[str]:
     return get_record(connection, domain, Record.DOGE, True)
+
 
 def get_email_record(connection: Client, domain: str) -> Optional[str]:
     return get_record(connection, domain, Record.Email, True)
 
+
 def get_url_record(connection: Client, domain: str) -> Optional[str]:
     return get_record(connection, domain, Record.Url, True)
+
 
 def get_discord_record(connection: Client, domain: str) -> Optional[str]:
     return get_record(connection, domain, Record.Discord, True)
 
+
 def get_github_record(connection: Client, domain: str) -> Optional[str]:
     return get_record(connection, domain, Record.Github, True)
+
 
 def get_reddit_record(connection: Client, domain: str) -> Optional[str]:
     return get_record(connection, domain, Record.Reddit, True)
 
+
 def get_twitter_record(connection: Client, domain: str) -> Optional[str]:
     return get_record(connection, domain, Record.Twitter, True)
+
 
 def get_telegram_record(connection: Client, domain: str) -> Optional[str]:
     return get_record(connection, domain, Record.Telegram, True)
 
+
 def get_pic_record(connection: Client, domain: str) -> Optional[str]:
     return get_record(connection, domain, Record.Pic, True)
+
 
 def get_shdw_record(connection: Client, domain: str) -> Optional[str]:
     return get_record(connection, domain, Record.SHDW, True)
 
+
 def get_point_record(connection: Client, domain: str) -> Optional[str]:
     return get_record(connection, domain, Record.POINT, True)
+
 
 def get_bsc_record(connection: Client, domain: str) -> Optional[str]:
     return get_record(connection, domain, Record.BSC, True)
 
+
 def get_injective_record(connection: Client, domain: str) -> Optional[str]:
     return get_record(connection, domain, Record.Injective, True)
 
+
 def get_backpack_record(connection: Client, domain: str) -> Optional[str]:
     return get_record(connection, domain, Record.Backpack, True)
+
 
 def serialize_sol_record(
         content: Pubkey, record_key: Pubkey, signer: Pubkey, signature: bytes) -> bytes:

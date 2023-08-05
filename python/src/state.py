@@ -47,8 +47,8 @@ class TokenData(CStruct):
         "ticker" / String,
         "mint" / Bytes(32),
         "decimals" / U32,
-        "website" / Optional[String],
-        "logoUri" / Optional[String]
+        "website" / String,
+        "logoUri" / String
     )
 
     def __init__(self, name: str, ticker: str, mint: U32, decimals: int,
